@@ -40,6 +40,16 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
     cudaDeviceProp device_prop = {};
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, device_id));
 
+    /*
+    int device_id：来自cudaGetDevice
+    int* task_fifo_ptrs[NUM_MAX_NVL_PEERS]：
+        任务队列，用于机内IPC通信。在后面notify_dispatch会用到，dispatch不会用到。
+    cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS]：
+        来自cudaIpcGetMemHandle，用于建立机内IPC通信，创建buffer_ptrs。
+    void* buffer_ptrs[NUM_MAX_NVL_PEERS]：
+        NVLink Buffer，用于机内IPC通信。
+    */
+
     if (num_nvl_bytes > 0) {
         // Local IPC: alloc local memory and set local IPC handle
         CUDA_CHECK(cudaMalloc(&buffer_ptrs[nvl_rank], num_nvl_bytes + fifo_bytes + buffer_ptr_bytes + task_ptr_bytes));
@@ -164,6 +174,12 @@ void Buffer::sync(const std::vector<int> &device_ids,
                   const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
     EP_HOST_ASSERT(not is_available());
+    /*
+    对每一个机内的peer，都执行：
+    1.打开IPC handle
+    2.创建任务队列task_fifo_ptrs
+    3.将相关的变量同步到GPU上。
+    */
 
     // Sync IPC handles
     if (num_nvl_bytes > 0) {
@@ -175,6 +191,7 @@ void Buffer::sync(const std::vector<int> &device_ids,
             EP_HOST_ASSERT(handle_str.size() == CUDA_IPC_HANDLE_SIZE);
             if (offset + i != rank) {
                 std::memcpy(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE);
+                // 打开IPC handle
                 CUDA_CHECK(cudaIpcOpenMemHandle(&buffer_ptrs[i], ipc_handles[i], cudaIpcMemLazyEnablePeerAccess));
                 task_fifo_ptrs[i] = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
             } else {
@@ -182,11 +199,22 @@ void Buffer::sync(const std::vector<int> &device_ids,
             }
         }
 
-        // Copy all buffer and task pointers to GPU
+        // Copy all buffer and task pointers to GPU 相关的变量同步到GPU上。
         CUDA_CHECK(cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs, sizeof(void*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(task_fifo_ptrs_gpu, task_fifo_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+
+    /*
+    如果需要机间通信，则
+
+    初始化nvshmem：internode::init(...)，内部调用
+        - nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
+        - nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
+        这里对于非low_latency模式，每个nvshmem的通信组是所有rdma rank上nvl rank相同的GPU，即通信组数量为nvl rank数量，每个通信组的大小为rdma rank的数量，每个通信组的root位于rdma rank=0的节点上。
+        若4机32卡，则有8个（nvl ranks）通信组,大小为4
+        
+    */
 
     // Sync NVSHMEM handles and allocate memory
     if (num_rdma_bytes > 0) {
@@ -197,10 +225,16 @@ void Buffer::sync(const std::vector<int> &device_ids,
         std::memcpy(root_unique_id.data(), root_unique_id_str.c_str(), root_unique_id_opt->size());
         auto nvshmem_rank = low_latency_mode ? rank : rdma_rank;
         auto num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
+        // 位于runtime.cu line 44
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
         internode::barrier();
 
         // Allocate
+        
+        // 创建NVSHMEM的共享内存指针rdma_buffer_ptr，内部是
+        //      - nvshmem_align(alignment, size);
+        //      此后，所有GPU可以用rdma_buffer_ptr来创建共享的buffer，然后使用nvshmem进行通信
+        // 至此初始化部分就完成了。
         rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
 
         // Clean buffer (mainly for low-latency mode)

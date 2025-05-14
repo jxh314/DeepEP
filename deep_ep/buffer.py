@@ -17,6 +17,11 @@ class Buffer:
         - high-throughput internode all-to-all (dispatch and combine, using RDMA and NVLink)
         - low-latency all-to-all (dispatch and combine, using RDMA)
 
+    Mixture of Experts (MoE) 模型的核心专家并行 (EP) 通信缓冲区，支持以下功能：
+        - 高吞吐量的节点内 all-to-all 通信（分发和合并，使用 NVLink）
+        - 高吞吐量的节点间 all-to-all 通信（分发和合并，使用 RDMA 和 NVLink）
+        - 低延迟的 all-to-all 通信（分发和合并，使用 RDMA）
+
     Attributes:
         num_sms: the SMs used in high-throughput kernels.
         rank: the local rank number.
@@ -25,6 +30,15 @@ class Buffer:
         num_nvl_bytes: the buffer size for intranode NVLink communication.
         num_rdma_bytes: the buffer size for internode (also for intranode with low-latency mode) RDMA communication.
         runtime: the C++ runtime.
+        
+    属性：
+        num_sms: 用于高吞吐量内核的 SM 数量。
+        rank: 本地的 rank 编号。
+        group_size: 组内的 rank 数量。
+        group: 通信组。
+        num_nvl_bytes: 节点内 NVLink 通信的缓冲区大小。
+        num_rdma_bytes: 节点间（或低延迟模式下的节点内）RDMA 通信的缓冲区大小。
+        runtime: C++ 运行时。
     """
 
     num_sms: int = 20
@@ -33,7 +47,7 @@ class Buffer:
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
                  low_latency_mode: bool = False, num_qps_per_rank: int = 12) -> None:
         """
-        Initialize the communication buffer.
+        Initialize the communication buffer.初始化通信缓冲区。 
 
         Arguments:
             group: the communication group.
@@ -42,6 +56,13 @@ class Buffer:
             low_latency_mode: whether to enable low-latency mode.
             num_qps_per_rank: the number of QPs for RDMA, the low-latency mode requires that this number equals
                 to the number of local experts.
+
+        参数：
+            group: 通信组。
+            num_nvl_bytes: 节点内 NVLink 通信的缓冲区大小。
+            num_rdma_bytes: 节点间（或低延迟模式下的节点内）RDMA 通信的缓冲区大小。
+            low_latency_mode: 是否启用低延迟模式。
+            num_qps_per_rank: 每个 RDMA rank 的 QP 数量，低延迟模式要求该值等于本地专家的数量。
         """
 
         # Initialize the CPP runtime
@@ -51,19 +72,22 @@ class Buffer:
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
+        # 这里创建runtime调用的是csrc/deep_ep.cpp里的Buffer的构造函数，其内部主要是初始化了一些成员变量
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode)
 
+        # 使用dist来同步device_id，即cudaGetDevice获得的device_id
         # Synchronize device IDs
         device_ids = [None, ] * self.group_size
         local_device_id = self.runtime.get_local_device_id()
         dist.all_gather_object(device_ids, local_device_id, group)
 
-        # Synchronize IPC handles
+        # Synchronize IPC handles ， 同步ipc_handle，由前面的cudaIpcGetMemHandle获得
         ipc_handles = [None, ] * self.group_size
         local_ipc_handle = self.runtime.get_local_ipc_handle()
         dist.all_gather_object(ipc_handles, local_ipc_handle, group)
 
         # Synchronize NVSHMEM unique IDs
+        # 获取root的NVSHMEM的unique_id，然后同步它
         root_unique_id = None
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
             # Enable IBGDA 
@@ -80,10 +104,12 @@ class Buffer:
             # Synchronize using the root ID
             nvshmem_unique_ids = [None, ] * self.group_size
             if (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
+                # 内部调用nvshmemx_get_uniqueid
                 root_unique_id = self.runtime.get_local_nvshmem_unique_id()
             dist.all_gather_object(nvshmem_unique_ids, root_unique_id, group)
             root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
 
+        # 现在已经获取了所有对端的信息。接下来创建IPC和NVSHMEM的结构- deepep.cpp->Buffer::sync
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
