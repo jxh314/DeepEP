@@ -225,6 +225,7 @@ class Buffer:
         return config_map[num_ranks]
 
     # noinspection PyTypeChecker
+    # 根据本地的topk_idx，来计算本地要发往每个rank和每个expert的token数量。其内部使用了GPU来加速计算
     def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int,
                             previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                             allocate_on_comm_stream: bool = False) -> \
@@ -237,6 +238,7 @@ class Buffer:
                 `-1` means no selections.
             num_experts: the number of experts.
             previous_event: the event to wait before actually executing the kernel.
+            previous_event: 如果不是None，则需要等待这个事件结束才会执行kernel。这个参数可以用于描绘流水线并行中的依赖关系。
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
 
@@ -246,8 +248,10 @@ class Buffer:
                 rank (with the same GPU index), return `None` for intranode settings.
             num_tokens_per_expert: `[num_experts]` with `torch.int`, the number of tokens to be sent to each expert.
             is_token_in_rank: `[num_tokens, num_ranks]` with `torch.bool`, whether a token be sent to a rank.
+            is_token_in_rank: 每个token是否发往每个rank
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
+        # deepep.cpp -> Buffer::get_dispatch_layout
         num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = \
             self.runtime.get_dispatch_layout(topk_idx, num_experts, getattr(previous_event, 'event', None),
                                              async_finish, allocate_on_comm_stream)
@@ -289,6 +293,27 @@ class Buffer:
             previous_event: the event to wait before actually executing the kernel.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+        
+        Arguments:
+            x: token的数据
+            x: `torch.Tensor` 或 `torch.Tensor` 的元组。
+                - 如果是单个张量，形状必须为 `[num_tokens, hidden]`，类型为 `torch.bfloat16`。
+                - 如果是元组，第一个元素的形状必须为 `[num_tokens, hidden]`，类型为 `torch.float8_e4m3fn`；
+                第二个元素的形状必须为 `[num_tokens, hidden // 128]`（要求可整除），类型为 `torch.float`。
+            handle: 如果设置了handle，则会重用之前计算过的layout信息。这个可用于backward的combine(本质上是dispatch)
+            handle: 可选的通信句柄。如果设置了，CPU 将重用布局信息以节省时间。
+            num_tokens_per_rank: `[num_ranks]`，类型为 `torch.int`，表示发送到每个 rank 的 token 数量。
+            num_tokens_per_rdma_rank: `[num_rdma_ranks]`，类型为 `torch.int`，表示发送到每个 RDMA rank（具有相同 GPU 索引）的 token 数量。
+                对于节点内设置，返回 `None`。
+            is_token_in_rank: `[num_tokens, num_ranks]`，类型为 `torch.bool`，表示某个 token 是否会被发送到某个 rank。
+            num_tokens_per_expert: `[num_experts]`，类型为 `torch.int`，表示发送到每个专家的 token 数量。
+            topk_idx: `[num_tokens, num_topk]`，类型为 `torch.int64`，表示每个 token 选择的专家索引，`-1` 表示未选择。
+            topk_weights: `[num_tokens, num_topk]`，类型为 `torch.float`，表示每个 token 分发到专家的权重。
+            expert_alignment: 对齐每个本地专家接收的 token 数量到此变量。
+            config: 性能调优配置。
+            previous_event: 在实际执行内核之前需要等待的事件。
+            async_finish: 如果设置，当前流不会等待通信内核完成。
+            allocate_on_comm_stream: 控制是否将所有分配的张量的所有权分配到通信流上。
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`, but the number of tokens equals to the
@@ -321,7 +346,9 @@ class Buffer:
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
-            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
+            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, \
+                num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, \
+                recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
                 self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
                                       num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
                                       expert_alignment, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
@@ -391,21 +418,27 @@ class Buffer:
         assert config is not None
 
         # Launch the kernel with cached or non-cached mode
+        #   - 缓存模式：重用之前的布局信息，减少计算开销。
+        #   - 非缓存模式：重新计算布局信息，适用于首次分发或布局发生变化的情况。
+        #   核心逻辑：调用 self.runtime.internode_dispatch 完成节点间分发，返回分发结果和通信句柄。
         x, x_scales = x if isinstance(x, tuple) else (x, None)
         if handle is not None:
+            # 如果提供了 handle，则使用缓存的布局信息
             assert topk_idx is None and topk_weights is None
             is_token_in_rank, \
                 rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, \
                 recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
                 recv_src_meta, send_rdma_head, send_nvl_head = handle
-            num_recv_tokens = recv_src_meta.size(0)
-            num_rdma_recv_tokens = send_nvl_head.size(0)
+            num_recv_tokens = recv_src_meta.size(0)  # 接收的 token 数量
+            num_rdma_recv_tokens = send_nvl_head.size(0)  # RDMA 接收的 token 数量
+            # 调用internode_dispatch进行节点间分发,deep_ep.cpp —— Buffer::internode_dispatch
             recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights,
                 None, None, is_token_in_rank, None,
                 num_recv_tokens, num_rdma_recv_tokens,
                 rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
                 expert_alignment, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            # 返回接收到的 tokens 和事件对象
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
@@ -418,6 +451,7 @@ class Buffer:
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
                 expert_alignment, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            # 创建通信句柄
             handle = (is_token_in_rank,
                       rdma_channel_prefix_matrix, gbl_channel_prefix_matrix,
                       recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,

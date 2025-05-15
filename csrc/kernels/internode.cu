@@ -121,6 +121,7 @@ get_dispatch_layout(const int64_t* topk_idx,
     }
 }
 
+// host function
 void get_dispatch_layout(const int64_t* topk_idx,
                          int* num_tokens_per_rank, int* num_tokens_per_rdma_rank,
                          int* num_tokens_per_expert, bool* is_token_in_rank,

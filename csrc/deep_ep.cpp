@@ -213,7 +213,6 @@ void Buffer::sync(const std::vector<int> &device_ids,
         - nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
         这里对于非low_latency模式，每个nvshmem的通信组是所有rdma rank上nvl rank相同的GPU，即通信组数量为nvl rank数量，每个通信组的大小为rdma rank的数量，每个通信组的root位于rdma rank=0的节点上。
         若4机32卡，则有8个（nvl ranks）通信组,大小为4
-        
     */
 
     // Sync NVSHMEM handles and allocate memory
@@ -279,7 +278,8 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
     if (is_internode_available())
         num_tokens_per_rdma_rank = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
 
-    internode::get_dispatch_layout(topk_idx.data_ptr<int64_t>(),
+        // internode.cu —— void get_dispatch_layout（）
+        internode::get_dispatch_layout(topk_idx.data_ptr<int64_t>(),
                                    num_tokens_per_rank.data_ptr<int>(),
                                    num_tokens_per_rdma_rank.has_value() ? num_tokens_per_rdma_rank.value().data_ptr<int>() : nullptr,
                                    num_tokens_per_expert.data_ptr<int>(),
@@ -639,20 +639,25 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
     return {recv_x, recv_topk_weights, event};
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<EventHandle>>
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, 
+        torch::Tensor, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, 
+        std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<EventHandle>>
 Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& x_scales,
                            const std::optional<torch::Tensor>& topk_idx, const std::optional<torch::Tensor>& topk_weights,
                            const std::optional<torch::Tensor>& num_tokens_per_rank, const std::optional<torch::Tensor>& num_tokens_per_rdma_rank,
                            const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
                            int cached_num_recv_tokens, int cached_num_rdma_recv_tokens,
                            const std::optional<torch::Tensor>& cached_rdma_channel_prefix_matrix, const std::optional<torch::Tensor>& cached_recv_rdma_rank_prefix_sum,
-                           const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix, const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
+                           const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix, const std::optional<t`orch::Tensor>& cached_recv_gbl_rank_prefix_sum,
                            int expert_alignment, const Config& config, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
-    // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
-    // unless we release GIL here.
+    // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get 
+    // stuck due to GIL unless we release GIL here.
+    // 在分发（dispatch）过程中，CPU 会忙等待（busy-wait），直到 GPU 从其他 rank 接收到张量大小的元数据，这可能会耗费较长时间。
+    // 如果 DeepEP 的用户需要在其他线程上执行其他 Python 代码（例如 KV 数据传输），由于 GIL的存在，他们的代码可能会被阻塞，除非我们在这里释放 GIL。
     pybind11::gil_scoped_release release;
 
+    // 1个channel对应2个SM
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     EP_HOST_ASSERT(0 < get_num_rdma_ranks() and get_num_rdma_ranks() <= NUM_MAX_RDMA_PEERS);
@@ -735,6 +740,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
         x_scales_ptr = x_scales->data_ptr<float>();
     }
 
+    // 设置comm_stream
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
     auto compute_stream = at::cuda::getCurrentCUDAStream();
@@ -743,6 +749,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
         at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
+    // 等待前置任务完成
     // Wait previous tasks to be finished
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
@@ -760,6 +767,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
 
     // Barrier or send sizes
     if (cached_mode) {
+        // 如果之前进行过dispatch，则可以重用之前的结果
         num_recv_tokens = cached_num_recv_tokens;
         num_rdma_recv_tokens = cached_num_rdma_recv_tokens;
         rdma_channel_prefix_matrix = cached_rdma_channel_prefix_matrix.value();
@@ -778,6 +786,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                  num_nvl_bytes, true, low_latency_mode);
         move_fifo_slots(2);
     } else {
+        // 否则，需要进行计算
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         gbl_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -801,6 +810,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                    num_nvl_bytes, low_latency_mode);
         move_fifo_slots(3);
 
+        // 等待notify_dispatch完成
         // Synchronize total received tokens and tokens per expert
         auto start_time = std::chrono::high_resolution_clock::now();
         while (true) {
@@ -831,7 +841,9 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
     auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(), recv_x_scales = std::optional<torch::Tensor>();
     auto recv_src_meta = std::optional<torch::Tensor>();
+    // 形状(num_rdma_ranks, num_channels)，每个channel要发往每个RDMA节点token数量的前缀和
     auto recv_rdma_channel_prefix_matrix = std::optional<torch::Tensor>();
+    // 形状(num_ranks, num_channels)，每个channel要发往每个GPU的token数量的前缀和
     auto recv_gbl_channel_prefix_matrix = std::optional<torch::Tensor>();
     auto send_rdma_head = std::optional<torch::Tensor>();
     auto send_nvl_head = std::optional<torch::Tensor>();
@@ -843,7 +855,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
         send_nvl_head = torch::empty({num_rdma_recv_tokens, NUM_MAX_NVL_PEERS}, dtype(torch::kInt32).device(torch::kCUDA));
     }
 
-    // Assign pointers
+    // Assign pointers 创建接收数据的tensor
     int64_t* recv_topk_idx_ptr = nullptr;
     float* recv_topk_weights_ptr = nullptr;
     float* recv_x_scales_ptr = nullptr;
