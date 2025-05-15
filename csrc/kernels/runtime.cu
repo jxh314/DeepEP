@@ -45,7 +45,9 @@ int init(const std::vector<uint8_t> &root_unique_id_val, int rank, int num_ranks
     nvshmemx_uniqueid_t root_unique_id;
     nvshmemx_init_attr_t attr;
     std::memcpy(&root_unique_id, root_unique_id_val.data(), sizeof(nvshmemx_uniqueid_t));
+    // 设置初始化参数
     nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
+    // 初始化 NVSHMEM 环境
     nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
 
     // Create sub-RDMA teams
