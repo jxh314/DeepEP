@@ -147,7 +147,7 @@ public:
                         const std::optional<torch::Tensor>& out = std::nullopt);
 
     torch::Tensor
-    get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
+    get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) const;
 };
 
 } // namespace deep_ep

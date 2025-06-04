@@ -1236,8 +1236,9 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
 }
 
 torch::Tensor
-Buffer::get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
+Buffer::get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) const {
     LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
+
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto dtype = torch::kBFloat16;
     auto num_msg_elems = static_cast<int>(buffer.num_bytes_per_combine_msg / elementSize(torch::kBFloat16));

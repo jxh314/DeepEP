@@ -45,7 +45,8 @@ class Buffer:
 
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
-                 low_latency_mode: bool = False, num_qps_per_rank: int = 12) -> None:
+                 low_latency_mode: bool = False, num_qps_per_rank: int = 12,
+                 allow_nvlink_for_low_latency_mode: bool = True) -> None:
         """
         Initialize the communication buffer.初始化通信缓冲区。 
 
@@ -56,6 +57,10 @@ class Buffer:
             low_latency_mode: whether to enable low-latency mode.
             num_qps_per_rank: the number of QPs for RDMA, the low-latency mode requires that this number equals
                 to the number of local experts.
+            allow_nvlink_for_low_latency_mode: whether allow NVLink traffic for low-latency mode, you should notice
+                this is somehow incompatible with the hook-based overlapping.
+                Warning: PCIe connections may lead to errors due to memory ordering issues,
+                please make sure all connections are via NVLink.
 
         参数：
             group: 通信组。
@@ -92,7 +97,7 @@ class Buffer:
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
             # Enable IBGDA 
             assert num_qps_per_rank > 0
-            os.environ['NVSHMEM_DISABLE_P2P'] = '1'
+            os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
             os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
             os.environ['NVSHMEM_IBGDA_NIC_HANDLER'] = 'gpu'
             os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
