@@ -8,66 +8,19 @@
 
 ## Prerequisites
 
-1. [GDRCopy](https://github.com/NVIDIA/gdrcopy) (v2.4 and above recommended) is a low-latency GPU memory copy library based on NVIDIA GPUDirect RDMA technology, and *it requires kernel module installation with root privileges.*
-
-2. Hardware requirements
-   - GPUDirect RDMA capable devices, see [GPUDirect RDMA Documentation](https://docs.nvidia.com/cuda/gpudirect-rdma/)
+Hardware requirements:
+   - GPUs inside one node needs to be connected by NVLink
+   - GPUs across different nodes needs to be connected by RDMA devices, see [GPUDirect RDMA Documentation](https://docs.nvidia.com/cuda/gpudirect-rdma/)
    - InfiniBand GPUDirect Async (IBGDA) support, see [IBGDA Overview](https://developer.nvidia.com/blog/improving-network-performance-of-hpc-systems-using-nvidia-magnum-io-nvshmem-and-gpudirect-async/)
    - For more detailed requirements, see [NVSHMEM Hardware Specifications](https://docs.nvidia.com/nvshmem/release-notes-install-guide/install-guide/abstract.html#hardware-requirements)
 
 ## Installation procedure
 
-### 1. Install GDRCopy
-
-GDRCopy requires kernel module installation on the host system. Complete these steps on the bare-metal host before container deployment:
-
-#### Build and installation
-
-```bash
-wget https://github.com/NVIDIA/gdrcopy/archive/refs/tags/v2.4.4.tar.gz
-cd gdrcopy-2.4.4/
-make -j$(nproc)
-sudo make prefix=/opt/gdrcopy install
-```
-
-#### Kernel module installation
-
-After compiling the software, you need to install the appropriate packages based on your Linux distribution.
-For instance, using Ubuntu 22.04 and CUDA 12.3 as an example:
-
-```bash
-pushd packages
-CUDA=/path/to/cuda ./build-deb-packages.sh
-sudo dpkg -i gdrdrv-dkms_2.4.4_amd64.Ubuntu22_04.deb \
-             libgdrapi_2.4.4_amd64.Ubuntu22_04.deb \
-             gdrcopy-tests_2.4.4_amd64.Ubuntu22_04+cuda12.3.deb \
-             gdrcopy_2.4.4_amd64.Ubuntu22_04.deb
-popd
-sudo ./insmod.sh  # Load kernel modules on the bare-metal system
-```
-
-#### Container environment notes
-
-For containerized environments:
-1. Host: keep kernel modules loaded (`gdrdrv`)
-2. Container: install DEB packages *without* rebuilding modules:
-   ```bash
-   sudo dpkg -i gdrcopy_2.4.4_amd64.Ubuntu22_04.deb \
-                libgdrapi_2.4.4_amd64.Ubuntu22_04.deb \
-                gdrcopy-tests_2.4.4_amd64.Ubuntu22_04+cuda12.3.deb
-   ```
-
-#### Verification
-
-```bash
-gdrcopy_copybw  # Should show bandwidth test results
-```
-
-### 2. Acquiring NVSHMEM source code
+### 1. Acquiring NVSHMEM source code
 
 Download NVSHMEM v3.2.5 from the [NVIDIA NVSHMEM OPEN SOURCE PACKAGES](https://developer.nvidia.com/downloads/assets/secure/nvshmem/nvshmem_src_3.2.5-1.txz).
 
-### 3. Apply our custom patch
+### 2. Apply our custom patch
 
 Navigate to your NVSHMEM source directory and apply our provided patch:
 
@@ -75,7 +28,7 @@ Navigate to your NVSHMEM source directory and apply our provided patch:
 git apply /path/to/deep_ep/dir/third-party/nvshmem.patch
 ```
 
-### 4. Configure NVIDIA driver
+### 3. Configure NVIDIA driver (required by inter-node communication)
 
 Enable IBGDA by modifying `/etc/modprobe.d/nvidia.conf`:
 
@@ -92,26 +45,31 @@ sudo reboot
 
 For more detailed configurations, please refer to the [NVSHMEM Installation Guide](https://docs.nvidia.com/nvshmem/release-notes-install-guide/install-guide/abstract.html).
 
-### 5. Build and installation
+### 4. Build and installation
 
-The following example demonstrates building NVSHMEM with IBGDA support:
+DeepEP uses NVLink for intra-node communication and IBGDA for inter-node communication. All the other features are disabled to reduce the dependencies.
 
 ```bash
-CUDA_HOME=/path/to/cuda \
-GDRCOPY_HOME=/path/to/gdrcopy \
-NVSHMEM_SHMEM_SUPPORT=0 \
-NVSHMEM_UCX_SUPPORT=0 \
-NVSHMEM_USE_NCCL=0 \
-NVSHMEM_MPI_SUPPORT=0 \
-NVSHMEM_IBGDA_SUPPORT=1 \
-NVSHMEM_PMIX_SUPPORT=0 \
-NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
-NVSHMEM_USE_GDRCOPY=1 \
-cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/path/to/your/dir/to/install
+export CUDA_HOME=/path/to/cuda
+# disable all features except IBGDA
+export NVSHMEM_IBGDA_SUPPORT=1
 
-cd build
-make -j$(nproc)
-make install
+export NVSHMEM_SHMEM_SUPPORT=0
+export NVSHMEM_UCX_SUPPORT=0
+export NVSHMEM_USE_NCCL=0
+export NVSHMEM_PMIX_SUPPORT=0
+export NVSHMEM_TIMEOUT_DEVICE_POLLING=0
+export NVSHMEM_USE_GDRCOPY=0
+export NVSHMEM_IBRC_SUPPORT=0
+export NVSHMEM_BUILD_TESTS=0
+export NVSHMEM_BUILD_EXAMPLES=0
+export NVSHMEM_MPI_SUPPORT=0
+export NVSHMEM_BUILD_HYDRA_LAUNCHER=0
+export NVSHMEM_BUILD_TXZ_PACKAGE=0
+export NVSHMEM_TIMEOUT_DEVICE_POLLING=0
+
+cmake -G Ninja -S . -B build -DCMAKE_INSTALL_PREFIX=/path/to/your/dir/to/install
+cmake --build build/ --target install
 ```
 
 ## Post-installation configuration

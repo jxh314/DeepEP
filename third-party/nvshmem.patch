@@ -435,3 +435,40 @@ index c89f408..f99018a 100644
  
      return NVSHMEMX_ERROR_INTERNAL;
  }
+
+
+From 099f608fcd9a1d34c866ad75d0af5d02d2020374 Mon Sep 17 00:00:00 2001
+From: Kaichao You <youkaichao@gmail.com>
+Date: Tue, 10 Jun 2025 00:35:03 -0700
+Subject: [PATCH] remove gdrcopy dependency
+
+---
+ src/modules/transport/ibgda/ibgda.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/modules/transport/ibgda/ibgda.cpp b/src/modules/transport/ibgda/ibgda.cpp
+index ef325cd..16ee09c 100644
+--- a/src/modules/transport/ibgda/ibgda.cpp
++++ b/src/modules/transport/ibgda/ibgda.cpp
+@@ -406,6 +406,7 @@ static size_t ibgda_get_host_page_size() {
+     return host_page_size;
+ }
+
++#ifdef NVSHMEM_USE_GDRCOPY
+ int nvshmemt_ibgda_progress(nvshmem_transport_t t) {
+     nvshmemt_ibgda_state_t *ibgda_state = (nvshmemt_ibgda_state_t *)t->state;
+     int n_devs_selected = ibgda_state->n_devs_selected;
+@@ -459,6 +460,11 @@ int nvshmemt_ibgda_progress(nvshmem_transport_t t) {
+     }
+     return 0;
+ }
++#else
++int nvshmemt_ibgda_progress(nvshmem_transport_t t) {
++    return NVSHMEMX_ERROR_NOT_SUPPORTED;
++}
++#endif
+
+ int nvshmemt_ibgda_show_info(struct nvshmem_transport *transport, int style) {
+     NVSHMEMI_ERROR_PRINT("ibgda show info not implemented");
+--
+2.34.1

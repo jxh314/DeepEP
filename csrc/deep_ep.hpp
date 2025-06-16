@@ -41,6 +41,7 @@ private:
 
     // Device info and communication
     int device_id;
+    int num_device_sms;
     int rank, rdma_rank, nvl_rank;
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
     cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
@@ -51,10 +52,9 @@ private:
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
 
-    // Task fifo
-    int head = 0;
-    int* task_fifo_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
-    int** task_fifo_ptrs_gpu = nullptr;
+    // Barrier signals
+    int* barrier_signal_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
+    int** barrier_signal_ptrs_gpu = nullptr;
 
     // Workspace
     void* workspace = nullptr;
@@ -70,9 +70,6 @@ private:
     // Host-side RDMA-level MoE info
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
-
-private:
-    void move_fifo_slots(int num_slots = 1);
 
 public:
     Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode);
@@ -108,7 +105,8 @@ public:
                        const std::optional<torch::Tensor>& topk_idx, const std::optional<torch::Tensor>& topk_weights,
                        const std::optional<torch::Tensor>& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
                        int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
-                       int expert_alignment, const Config& config, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream);
+                       int expert_alignment, int num_worst_tokens, const Config& config,
+                       std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
     intranode_combine(const torch::Tensor& x, const std::optional<torch::Tensor>& topk_weights,
@@ -136,8 +134,10 @@ public:
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
     low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
+                         const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                          int num_max_dispatch_tokens_per_rank, int num_experts,
-                         bool use_fp8, bool async, bool return_recv_hook);
+                         bool use_fp8, bool round_scale, bool use_ue8m0,
+                         bool async, bool return_recv_hook);
 
     std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
     low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,

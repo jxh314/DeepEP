@@ -1,4 +1,3 @@
-import os
 import time
 import torch
 import torch.distributed as dist
@@ -21,7 +20,8 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
     # Random data
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    x_e4m3 = per_token_cast_to_fp8(x)
+    x_e4m3 = per_token_cast_to_fp8(x) if deep_ep.Buffer.is_sm90_compiled() else None
+    x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T) if x_e4m3 is not None else None
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
@@ -80,7 +80,7 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
 
     for previous_mode in (False, True):
         for async_mode in (False, True):
-            for current_x in (x_pure_rand, x, x_e4m3):
+            for current_x in filter(lambda elem: elem is not None, (x_pure_rand, x, x_e4m3)):
                 for with_topk in (False, True):
                     if local_rank == 0:
                         print(f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...', flush=True, end='')
@@ -100,6 +100,7 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
                     assert gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist() == recv_num_tokens_per_expert_list
                     if current_x is not x_pure_rand:
                         check_data(recv_x, rank_prefix_matrix)
+                    recv_topk_weights_clone = None
                     if with_topk:
                         # Check `topk_idx`
                         assert (recv_topk_idx.eq(-1) | ((recv_topk_idx >= 0) & (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
@@ -107,9 +108,26 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
                             assert recv_topk_idx.eq(i).sum().item() == count
 
                         # Check `topk_weights`
+                        recv_topk_weights_clone = recv_topk_weights.clone()
                         if current_x is not x_pure_rand:
                             recv_topk_weights[recv_topk_idx.eq(-1)] = recv_topk_weights.amax(dim=1, keepdim=True).expand_as(recv_topk_weights)[recv_topk_idx.eq(-1)]
                             check_data(recv_topk_weights, rank_prefix_matrix)
+
+                    # Test `num_worst_tokens != 0`
+                    if with_topk:
+                        num_worst_tokens = num_tokens * num_ranks
+                        dispatch_args.update({'num_worst_tokens': num_worst_tokens})
+                        recv_worst_x, recv_worst_topk_idx, recv_worst_topk_weights, empty_list, _, event = buffer.dispatch(**dispatch_args)
+                        event.current_stream_wait() if async_mode else ()
+                        recv_worst_x = per_token_cast_back(*recv_worst_x) if isinstance(recv_worst_x, tuple) else recv_worst_x
+                        assert len(empty_list) == 0
+                        assert num_worst_tokens == recv_worst_x.size(0)
+                        assert num_worst_tokens == recv_worst_topk_idx.size(0)
+                        assert num_worst_tokens == recv_worst_topk_weights.size(0)
+                        assert torch.equal(recv_x, recv_worst_x[:recv_x.size(0)])
+                        assert torch.equal(recv_topk_idx, recv_worst_topk_idx[:recv_x.size(0)])
+                        assert torch.equal(recv_topk_weights_clone, recv_worst_topk_weights[:recv_x.size(0)])
+                        assert torch.all(recv_worst_topk_idx[recv_x.size(0):] == -1).item()
 
                     # Test cached dispatch (must without top-k staffs)
                     if not with_topk:
@@ -150,23 +168,29 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
     # Tune dispatch performance
     best_dispatch_results = None
     fp8_factor = (1 + 4 / 128) / 2
-    for current_x in (x_e4m3, x):
+    for current_x in filter(lambda elem: elem is not None, (x_e4m3, x)):
         best_time, best_results = 1e10, None
         nvl_recv_bytes = (dispatch_bf16_nvl_recv_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_nvl_recv_bytes
-        for nvl_chunk_size in range(4, 33, 4):
-            config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
+        for nvl_chunk_size in tuple(range(4, 33, 2)) + (0, ):
+            if nvl_chunk_size > 0:
+                config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
+            else:
+                # Test default config as well
+                deep_ep.Buffer.set_num_sms(num_sms)
+                config = deep_ep.Buffer.get_dispatch_config(num_ranks)
             tune_args = {'x': current_x, 'handle': handle, 'config': config}
             t = bench(lambda: buffer.dispatch(**tune_args))[0]
-            if t < best_time:
+            if t < best_time and nvl_chunk_size > 0:
                 best_time, best_results = t, (num_sms, nvl_chunk_size)
             if local_rank == 0:
-                print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}: {nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL) ', flush=True)
+                print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size if nvl_chunk_size else "default"}: '
+                      f'{nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL) ', flush=True)
         if local_rank == 0:
             print(f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)', flush=True)
             print('', flush=True)
 
-        if isinstance(current_x, tuple):
-            # Gather FP8 the best config from rank 0
+        # Gather the best config from rank 0 and the first test setting
+        if best_dispatch_results is None:
             best_dispatch_results = torch.tensor([best_results[0], best_results[1]], dtype=torch.int32, device='cuda')
             all_best_fp8_results_list = [torch.zeros_like(best_dispatch_results) for _ in range(torch.distributed.get_world_size())]
             dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
@@ -180,13 +204,19 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
 
     # Tune combine performance
     best_time, best_results = 1e10, None
-    for nvl_chunk_size in range(1, 7, 1):
-        config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
+    for nvl_chunk_size in tuple(range(1, 17, 1)) + (0, ):
+        if nvl_chunk_size > 0:
+            config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
+        else:
+            # Test default config as well
+            deep_ep.Buffer.set_num_sms(num_sms)
+            config = deep_ep.Buffer.get_combine_config(num_ranks)
         tune_args = {'x': recv_x, 'handle': handle, 'config': config}
         t = bench(lambda: buffer.combine(**tune_args))[0]
         if local_rank == 0:
-            print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}: {combine_bf16_nvl_send_bytes / 1e9 / t:.2f} GB/s (NVL) ', flush=True)
-            if t < best_time:
+            print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size if nvl_chunk_size else "default"}: '
+                  f'{combine_bf16_nvl_send_bytes / 1e9 / t:.2f} GB/s (NVL) ', flush=True)
+            if t < best_time and nvl_chunk_size > 0:
                 best_time, best_results = t, (num_sms, nvl_chunk_size)
 
     if local_rank == 0:
@@ -202,7 +232,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
         num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(ll_num_tokens, ll_hidden, num_ranks, ll_num_experts)
 
-    buffer = deep_ep.Buffer(group, int(1e9), num_rdma_bytes, low_latency_mode=test_ll_compatibility,
+    buffer = deep_ep.Buffer(group, int(2e9), num_rdma_bytes, low_latency_mode=test_ll_compatibility,
                             num_qps_per_rank=(ll_num_experts // num_ranks if test_ll_compatibility else 1))
     torch.manual_seed(rank)
 
@@ -215,6 +245,10 @@ def test_loop(local_rank: int, num_local_ranks: int):
     if test_ll_compatibility:
         buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
         test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
+
+    # Destroy the communication group
+    dist.barrier()
+    dist.destroy_process_group()
 
 
 if __name__ == '__main__':

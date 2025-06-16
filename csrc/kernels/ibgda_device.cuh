@@ -164,7 +164,7 @@ void ibgda_submit_requests(nvshmemi_ibgda_device_qp_t *qp, uint64_t base_wqe_idx
 
 __device__ static __forceinline__ void
 ibgda_write_rdma_write_inl_wqe(nvshmemi_ibgda_device_qp_t *qp, const uint32_t *val, uint64_t raddr,
-                               __be32 rkey, uint16_t wqe_idx, void **out_wqes, uint32_t imm) {
+                               __be32 rkey, uint16_t wqe_idx, void** out_wqes, uint32_t imm) {
     ibgda_ctrl_seg_t ctrl_seg;
     struct mlx5_wqe_raddr_seg raddr_seg;
     struct mlx5_wqe_inl_data_seg inl_seg;
@@ -277,7 +277,7 @@ nvshmemi_ibgda_rma_p(int *rptr, const int value, int dst_pe, int qp_id, uint32_t
 __device__ static __forceinline__ void
 ibgda_write_rdma_write_wqe(nvshmemi_ibgda_device_qp_t *qp, uint64_t laddr, __be32 lkey,
                            uint64_t raddr, __be32 rkey, uint32_t bytes, uint16_t wqe_idx,
-                           void **out_wqes) {
+                           void** out_wqes) {
     ibgda_ctrl_seg_t ctrl_seg;
     struct mlx5_wqe_raddr_seg raddr_seg;
     struct mlx5_wqe_data_seg data_seg;
@@ -373,7 +373,7 @@ nvshmemi_ibgda_put_nbi_warp(uint64_t req_rptr, uint64_t req_lptr, size_t bytes, 
 __device__ static __forceinline__ void ibgda_write_amo_add_wqe(
         nvshmemi_ibgda_device_qp_t *qp, const int &value,
         uint64_t laddr, __be32 lkey, uint64_t raddr, __be32 rkey,
-        uint16_t wqe_idx, void **out_wqes) {
+        uint16_t wqe_idx, void** out_wqes) {
     ibgda_ctrl_seg_t ctrl_seg = {0};
     struct mlx5_wqe_raddr_seg raddr_seg;
     struct mlx5_wqe_atomic_seg atomic_seg_1;
@@ -448,40 +448,27 @@ __device__ __forceinline__ uint64_t nvshmemi_get_p2p_ptr(const uint64_t& ptr, co
 // This is a simplified version of NVSHMEM's `ibgda_poll_cq`. 
 // Note that this implementation does not guarantee thread safety,
 // so we must ensure that no other threads are concurrently using the same QP.
-__device__ static __forceinline__ int 
+__device__ static __forceinline__ void
 ibgda_poll_cq(nvshmemi_ibgda_device_cq_t *cq, uint64_t idx) {
-    int status = 0;
-    struct mlx5_cqe64 *cqe64 = (struct mlx5_cqe64 *)cq->cqe;
-
+    const auto cqe64 = static_cast<mlx5_cqe64*>(cq->cqe);
     const uint32_t ncqes = cq->ncqes;
+    memory_fence_cta();
 
+    // NOTES: this while loop is part of do-while below.
+    // `wqe_counter` is the HW consumer index. However, we always maintain `index + 1`.
+    // To be able to compare with the index, we need to use `wqe_counter + 1`.
+    // Because `wqe_counter` is `uint16_t`, it may be overflow. Still, we know for
+    // sure that if `idx - wqe_counter - 1 < ncqes`, `wqe_counter + 1 is less than
+    // idx, and thus we need to wait. We don't need to wait when `idx == wqe_counter + 1`
+    // That's why we use `- 2` here to make this case overflow.
     uint16_t wqe_counter;
-    uint16_t new_wqe_counter;
-
-    memory_fence_cta();
-
     do {
-        new_wqe_counter = ld_na_relaxed(&cqe64->wqe_counter);
-        new_wqe_counter = HtoBE16(new_wqe_counter);
-        wqe_counter = new_wqe_counter;
-    }
-    // NOTE: This while loop is part of do while above.
-    // wqe_counter is the HW consumer index. However, we always maintain index
-    // + 1 in SW. To be able to compare with idx, we need to use wqe_counter +
-    // 1. Because wqe_counter is uint16_t, it may wraparound. Still we know for
-    // sure that if idx - wqe_counter - 1 < ncqes, wqe_counter + 1 is less than
-    // idx, and thus we need to wait. We don't need to wait when idx ==
-    // wqe_counter + 1. That's why we use - (uint16_t)2 here to make this case
-    // wraparound.
-    // Example:
-    // if idx = 10, we wait until wqe_counter = 9, idx - wqe_counter - 2 = 65535 > ncqes.
-    while (((uint16_t)((uint16_t)idx - wqe_counter - (uint16_t)2) < ncqes));
-
+        wqe_counter = HtoBE16(ld_na_relaxed(&cqe64->wqe_counter));
+    } while ((static_cast<uint16_t>(static_cast<uint16_t>(idx) - wqe_counter - static_cast<uint16_t>(2)) < ncqes));
     *cq->cons_idx = idx;
-    // Prevent reordering of this function and subsequent instructions
-    memory_fence_cta();
 
-    return status;
+    // Prevent reordering of this function and later instructions
+    memory_fence_cta();
 }
 
 // Wait until wqe `idx - 1` is completed.
