@@ -43,6 +43,16 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, device_id));
     num_device_sms = device_prop.multiProcessorCount;
 
+    /*
+    int device_id：来自cudaGetDevice
+    int* task_fifo_ptrs[NUM_MAX_NVL_PEERS]：
+        任务队列，用于机内IPC通信。在后面notify_dispatch会用到，dispatch不会用到。
+    cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS]：
+        来自cudaIpcGetMemHandle，用于建立机内IPC通信，创建buffer_ptrs。
+    void* buffer_ptrs[NUM_MAX_NVL_PEERS]：
+        NVLink Buffer，用于机内IPC通信。
+    */
+
     if (num_nvl_bytes > 0) {
         // Local IPC: alloc local memory and set local IPC handles
         CUDA_CHECK(cudaMalloc(&buffer_ptrs[nvl_rank], num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes));
@@ -168,6 +178,13 @@ void Buffer::sync(const std::vector<int> &device_ids,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
     EP_HOST_ASSERT(not is_available());
 
+    /*
+    对每一个机内的peer，都执行：
+    1.打开IPC handle
+    2.创建任务队列task_fifo_ptrs
+    3.将相关的变量同步到GPU上。
+    */
+
     // Sync IPC handles
     if (num_nvl_bytes > 0) {
         EP_HOST_ASSERT(num_ranks == device_ids.size());
@@ -178,6 +195,7 @@ void Buffer::sync(const std::vector<int> &device_ids,
             EP_HOST_ASSERT(handle_str.size() == CUDA_IPC_HANDLE_SIZE);
             if (offset + i != rank) {
                 std::memcpy(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE);
+                // 打开IPC handle
                 CUDA_CHECK(cudaIpcOpenMemHandle(&buffer_ptrs[i], ipc_handles[i], cudaIpcMemLazyEnablePeerAccess));
                 barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
             } else {
@@ -185,11 +203,22 @@ void Buffer::sync(const std::vector<int> &device_ids,
             }
         }
 
-        // Copy all buffer and barrier signal pointers to GPU
+        // Copy all buffer and barrier signal pointers to GPU 相关的变量同步到GPU上。
         CUDA_CHECK(cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs, sizeof(void*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+
+    /*
+    如果需要机间通信，则
+
+    初始化nvshmem：internode::init(...)，内部调用
+        - nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
+        - nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
+        这里对于非low_latency模式，每个nvshmem的通信组是所有 rdma rank 上 nvl rank 相同的GPU，即通信组数量为nvl rank数量，
+        每个通信组的大小为rdma rank的数量，每个通信组的root位于rdma rank=0的节点上。
+        若4机32卡，则有8个（nvl ranks）通信组,大小为4
+    */
 
     // Sync NVSHMEM handles and allocate memory
 #ifndef DISABLE_NVSHMEM
@@ -201,10 +230,18 @@ void Buffer::sync(const std::vector<int> &device_ids,
         std::memcpy(root_unique_id.data(), root_unique_id_str.c_str(), root_unique_id_opt->size());
         auto nvshmem_rank = low_latency_mode ? rank : rdma_rank;
         auto num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
+        // 位于runtime.cu line 48
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
         internode::barrier();
 
         // Allocate
+
+        /*
+        创建NVSHMEM的共享内存指针rdma_buffer_ptr，内部是
+             - nvshmem_align(alignment, size);
+             此后，所有GPU可以用rdma_buffer_ptr来创建共享的buffer，然后使用nvshmem进行通信
+        至此初始化部分就完成了。
+        */
         rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
 
         // Clean buffer (mainly for low-latency mode)
@@ -250,6 +287,7 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
     if (is_internode_available())
         num_tokens_per_rdma_rank = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
 
+    // internode.cu —— void get_dispatch_layout（）
     layout::get_dispatch_layout(topk_idx.data_ptr<int64_t>(),
                                 num_tokens_per_rank.data_ptr<int>(),
                                 num_tokens_per_rdma_rank.has_value() ? num_tokens_per_rdma_rank.value().data_ptr<int>() : nullptr,
@@ -632,8 +670,11 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
     // unless we release GIL here.
+    // 在分发（dispatch）过程中，CPU 会忙等待（busy-wait），直到 GPU 从其他 rank 接收到张量大小的元数据，这可能会耗费较长时间。Add commentMore actions
+    // 如果 DeepEP 的用户需要在其他线程上执行其他 Python 代码（例如 KV 数据传输），由于 GIL的存在，他们的代码可能会被阻塞，除非我们在这里释放 GIL。
     pybind11::gil_scoped_release release;
 
+    // 1个channel对应2个SM
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     EP_HOST_ASSERT(0 < get_num_rdma_ranks() and get_num_rdma_ranks() <= NUM_MAX_RDMA_PEERS);
@@ -720,13 +761,14 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
+    // 设置comm stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
         at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
-    // Wait previous tasks to be finished
+    // Wait previous tasks to be finished // 等待前置任务完成
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
     } else {
@@ -743,6 +785,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
 
     // Barrier or send sizes
     if (cached_mode) {
+        // 如果之前进行过dispatch，则可以重用之前的结果
         num_recv_tokens = cached_num_recv_tokens;
         num_rdma_recv_tokens = cached_num_rdma_recv_tokens;
         rdma_channel_prefix_matrix = cached_rdma_channel_prefix_matrix.value();
@@ -760,6 +803,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                  config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                  num_nvl_bytes, true, low_latency_mode);
     } else {
+        // 否则，需要进行计算
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         gbl_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -782,7 +826,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                    num_nvl_bytes, low_latency_mode);
 
-        // Synchronize total received tokens and tokens per expert
+        // Synchronize total received tokens and tokens per expert 等待notify_dispatch完成
         auto start_time = std::chrono::high_resolution_clock::now();
         while (true) {
             // Read total count
@@ -812,7 +856,9 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
     auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(), recv_x_scales = std::optional<torch::Tensor>();
     auto recv_src_meta = std::optional<torch::Tensor>();
+    // 形状(num_rdma_ranks, num_channels)，每个channel要发往每个RDMA节点token数量的前缀和
     auto recv_rdma_channel_prefix_matrix = std::optional<torch::Tensor>();
+    // 形状(num_ranks, num_channels)，每个channel要发往每个GPU的token数量的前缀和
     auto recv_gbl_channel_prefix_matrix = std::optional<torch::Tensor>();
     auto send_rdma_head = std::optional<torch::Tensor>();
     auto send_nvl_head = std::optional<torch::Tensor>();
@@ -824,7 +870,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
         send_nvl_head = torch::empty({num_rdma_recv_tokens, NUM_MAX_NVL_PEERS}, dtype(torch::kInt32).device(torch::kCUDA));
     }
 
-    // Assign pointers
+    // Assign pointers 创建接收数据的tensor
     int64_t* recv_topk_idx_ptr = nullptr;
     float* recv_topk_weights_ptr = nullptr;
     float* recv_x_scales_ptr = nullptr;

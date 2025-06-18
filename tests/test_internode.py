@@ -24,60 +24,81 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     x_e4m3 = per_token_cast_to_fp8(x)
     x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T)
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    # 分组和筛选
     group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
     masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
+    # masked_scores是经过分组和筛选后的分数矩阵。
+    # torch.topk 返回每个 token 的 top-k 候选项索引，num_topk 决定了候选项的数量。
+    # topk_idx是一个形状为 (num_tokens, num_topk) 的张量，表示每个 token 对应的 top-k 专家索引
+    #   用于计算每个 token 的分发目标（如 RDMA 索引和 rank 索引）。
     topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    # topk_weights 是与 topk_idx 对应的权重，用于后续的通信和计算。
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    # top-k 个expert所在的rank
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx.masked_fill_(topk_idx == -1, -1)
-    inplace_unique(rank_idx, num_ranks)
+    inplace_unique(rank_idx, num_ranks)# 去重和范围限制
+    # 即node idx，token 的目标节点
     rdma_rank_idx = rank_idx // num_local_ranks
     rdma_rank_idx.masked_fill_(rank_idx == -1, -1)
     inplace_unique(rdma_rank_idx, num_nodes)
 
     # RDMA dispatch counts
     rdma_idx = topk_idx // (num_experts // num_nodes)
+    # 将无效的topk_idx（值为-1）对应的rdma_idx 设置为-1，表示这些 token 不参与 RDMA 分发。
     rdma_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rdma_idx, num_nodes)
+    # rdma_idx 中有效索引的数量。(num_tokens, num_topk)中有non负数的元素个数
     num_rdma_token_sent = rdma_idx.ne(-1).sum().item()
 
-    # Expert meta
+    # Expert meta  ——专家元数据统计
+    # 初始化每个专家的 token 数量
     num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
     for i in range(num_experts):
+        # 统计每个专家接收到的 token 数量，这里只是当前rank 发送给的专家，后面做all_reduce
         num_tokens_per_expert[i] = (topk_idx == i).sum()
-    gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
-    dist.all_reduce(gbl_num_tokens_per_expert, group=group)
+    gbl_num_tokens_per_expert = num_tokens_per_expert.clone()# 克隆本地统计结果
+    dist.all_reduce(gbl_num_tokens_per_expert, group=group)# 得到所有进程中每个专家接收到的 token 总数
 
-    # Rank layout meta
+    # Rank layout meta-rank布局元数据统计
     num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device='cuda')
     num_tokens_per_rdma_rank = torch.empty((num_nodes, ), dtype=torch.int, device='cuda')
-    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
+    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda') # 初始化 token 索引
     for i in range(num_ranks):
-        num_tokens_per_rank[i] = (rank_idx == i).sum()
-        token_sel = (rank_idx == i).max(dim=-1)[0]
-        count = token_sel.sum().item()
-        tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
-        tokens[:count] = torch.sort(tokens[:count])[0]
-        token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
+        num_tokens_per_rank[i] = (rank_idx == i).sum()  # 统计每个 rank 接收到的 token 数量Add commentMore actions
+        # token_sel 是一维，形状为(num_tokens,)每个元素表示对应的 token 是否被分配到当前 rank i：
+        token_sel = (rank_idx == i).max(dim=-1)[0] # 确定每个 token 是否被分配到当前 rank
+        count = token_sel.sum().item()  # 统计被分配到rank i 的 token 数量
+        # 返回【1】表示排序后的原始索引，假设token_sel=[1,0,1,0]，那么tokens=[0,2,1,3]，tokens[:count]=[0,2]
+        tokens = torch.sort(token_sel.to(torch.int), descending=True)[1] 
+        tokens[:count] = torch.sort(tokens[:count])[0] # tokens[:count]=[0,2] ->[0,2]
+        # 为有效 token 分配连续的索引-[0,1]
+        token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda') 
+
     for i in range(num_nodes):
+        # 统计每个 RDMA rank 接收到的 token 数量
         num_tokens_per_rdma_rank[i] = (rdma_rank_idx == i).sum()
-    token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
-    is_token_in_rank = token_idx_in_rank >= 0
+    token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)# 转置并转换为整型
+    is_token_in_rank = token_idx_in_rank >= 0  # 判断 token 是否有效
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
+    # 得到所有进程中每个 rank 接收到的 token 总数
     dist.all_reduce(gbl_num_tokens_per_rank, group=group)
 
     ref_num_tokens_per_rank, ref_num_tokens_per_rdma_rank, ref_num_tokens_per_expert, ref_is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
+    # 使用 torch.allclose 验证计算的布局是否与参考布局(ref)一致。
     assert torch.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
     assert torch.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
     assert torch.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
     assert torch.allclose(ref_is_token_in_rank, is_token_in_rank)
+    # 使用 bench 测量 buffer.get_dispatch_layout 的执行时间
     t = bench(lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
     if local_rank == 0:
         print(f'[layout] Kernel performance: {t * 1000:.3f} ms', flush=True)
         print('', flush=True)
+    # 用于同步所有进程
     group.barrier()
     time.sleep(1)
 
@@ -88,6 +109,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     # Test dispatch
     # noinspection PyShadowingNames
     def check_data(check_x, recv_gbl_rank_prefix_sum):
+        # 每行相等
         assert torch.allclose(check_x.amin(dim=1), check_x.amax(dim=1))
         check_start = 0
         for i in range(num_ranks):
@@ -107,6 +129,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         dispatch_args.update({'topk_idx': topk_idx, 'topk_weights': topk_weights_pure_rand if current_x is x_pure_rand else topk_weights})
                     if previous_mode:
                         dispatch_args.update({'previous_event': buffer.capture()})
+                    # Dispatch
                     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = buffer.dispatch(**dispatch_args)
                     event.current_stream_wait() if async_mode else ()
                     recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
@@ -186,12 +209,15 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
             print(f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)', flush=True)
             print('', flush=True)
 
+        # 同步最佳配置
         if isinstance(current_x, tuple):
             # Gather FP8 the best config from rank 0
             best_dispatch_results = torch.tensor([best_results[0], best_results[1], best_results[2]], dtype=torch.int32, device='cuda')
             all_best_fp8_results_list = [torch.zeros_like(best_dispatch_results) for _ in range(torch.distributed.get_world_size())]
+            # 使用 dist.all_gather 收集所有进程的最佳配置，并选择 rank 0 的配置作为最终结果。
             dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
             best_dispatch_results = all_best_fp8_results_list[0].tolist()
+    # 使用最佳配置重新dispatch
     dispatch_config = deep_ep.Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2], rdma_buffer_size)
 
     dispatch_args = {'x': x, 'num_tokens_per_rank': num_tokens_per_rank, 'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,
@@ -217,7 +243,9 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
 
 # noinspection PyUnboundLocalVariable
+# （忽略）未绑定局部变量的检查
 def test_loop(local_rank: int, num_local_ranks: int):
+    # 初始化分布式环境
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     test_ll_compatibility = True
@@ -227,15 +255,16 @@ def test_loop(local_rank: int, num_local_ranks: int):
     num_sms = 24
     num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if test_ll_compatibility else 0)
 
+    # 创建通信缓冲区
     buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=test_ll_compatibility,
                             num_qps_per_rank=num_qps_per_rank)
     assert num_local_ranks == 8 and num_ranks > 8
-    torch.manual_seed(rank)
+    torch.manual_seed(rank)# 设置当前进程的随机数种子
 
     for i in (num_sms, ):
         test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
         if local_rank == 0:
-            print('', flush=True)
+            print('', flush=True)# 确保输出立即刷新
 
     # Test compatibility with low latency functions
     if test_ll_compatibility:

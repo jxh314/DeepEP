@@ -571,7 +571,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
         // Release sequential lock
         lane_id == 0 ? (rdma_send_next_token_idx += 1) : 0;
-    } else if (warp_role == WarpRole::kRDMASenderCoordinator) {
+    } else if (warp_role == WarpRole::kRDMASenderCoordinator) { 
         // NOTES: in case of splitting, the issued put at the end of the buffer
         EP_DEVICE_ASSERT(num_max_rdma_chunked_recv_tokens % num_max_rdma_chunked_send_tokens == 0);
 
