@@ -23,7 +23,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     x_e4m3 = per_token_cast_to_fp8(x)
-    x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T)
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
 
     # 分组和筛选
@@ -250,7 +249,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
     num_sms = 24
-    num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if test_ll_compatibility else 0)
+    num_qps_per_rank = max(num_sms // 2, ll_num_experts // num_ranks if test_ll_compatibility else 0)
 
     # 创建通信缓冲区
     buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=test_ll_compatibility,
@@ -269,10 +268,6 @@ def test_loop(local_rank: int, num_local_ranks: int):
     if test_ll_compatibility:
         buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
         test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
-
-    # Destroy the communication group
-    dist.barrier()
-    dist.destroy_process_group()
 
 
 if __name__ == '__main__':

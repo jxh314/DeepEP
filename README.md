@@ -1,6 +1,6 @@
 # DeepEP
 
-DeepEP is a communication library tailored for Mixture-of-Experts (MoE) and expert parallelism (EP). It provides high-throughput and low-latency all-to-all GPU kernels, which are also known as MoE dispatch and combine. The library also supports low-precision operations, including FP8.
+DeepEP is a communication library tailored for Mixture-of-Experts (MoE) and expert parallelism (EP). It provides high-throughput and low-latency all-to-all GPU kernels, which are also as known as MoE dispatch and combine. The library also supports low-precision operations, including FP8.
 
 To align with the group-limited gating algorithm proposed in the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) paper, DeepEP offers a set of kernels optimized for asymmetric-domain bandwidth forwarding, such as forwarding data from NVLink domain to RDMA domain. These kernels deliver high throughput, making them suitable for both training and inference prefilling tasks. Additionally, they support SM (Streaming Multiprocessors) number control.
 
@@ -29,24 +29,20 @@ We test low-latency kernels on H800 with each connected to a CX7 InfiniBand 400 
 
 | Dispatch #EP | Latency | RDMA bandwidth | Combine #EP | Latency | RDMA bandwidth |
 |:------------:|:-------:|:--------------:|:-----------:|:-------:|:--------------:|
-|      8       |  77 us  |    98 GB/s     |      8      | 114 us  |    127 GB/s    |
-|      16      | 118 us  |    63 GB/s     |     16      | 195 us  |    74 GB/s     |
-|      32      | 155 us  |    48 GB/s     |     32      | 273 us  |    53 GB/s     |
-|      64      | 173 us  |    43 GB/s     |     64      | 314 us  |    46 GB/s     |
+|      8       | 163 us  |    46 GB/s     |      8      | 318 us  |    46 GB/s     |
+|      16      | 173 us  |    43 GB/s     |     16      | 329 us  |    44 GB/s     |
+|      32      | 182 us  |    41 GB/s     |     32      | 350 us  |    41 GB/s     |
+|      64      | 186 us  |    40 GB/s     |     64      | 353 us  |    41 GB/s     |
 |     128      | 192 us  |    39 GB/s     |     128     | 369 us  |    39 GB/s     |
 |     256      | 194 us  |    39 GB/s     |     256     | 360 us  |    40 GB/s     |
-
-**News (2025.06.05)**: low-latency kernels now leverage NVLink as much as possible, see [#173](https://github.com/deepseek-ai/DeepEP/pull/173) for more details. Thanks for the contribution!
 
 ## Quick start
 
 ### Requirements
 
-- Ampere (SM80), Hopper (SM90) GPUs, or other architectures with SM90 PTX ISA support
+- Hopper GPUs (may support more architectures or devices later)
 - Python 3.8 and above
-- CUDA version
-  - CUDA 11.0 and above for SM80 GPUs
-  - CUDA 12.3 and above for SM90 GPUs
+- CUDA 12.3 and above
 - PyTorch 2.1 and above
 - NVLink for intranode communication
 - RDMA network for internode communication
@@ -76,13 +72,6 @@ python tests/test_low_latency.py
 ```bash
 NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py install
 ```
-
-#### Installation environment variables
-
-- `NVSHMEM_DIR`: the path to the NVSHMEM directory, disable all internode and low-latency features if not specified 
-- `DISABLE_SM90_FEATURES`: 0 or 1, whether to disable SM90 features, it is required for SM90 devices or CUDA 11
-- `TORCH_CUDA_ARCH_LIST`: the list of target architectures, e.g. `TORCH_CUDA_ARCH_LIST="9.0"`
-- `DISABLE_AGGRESSIVE_PTX_INSTRS`: 0 or 1, whether to disable aggressive load/store instructions, see [Undefine behavior PTX usage](#undefined-behavior-ptx-usage) for more details
 
 Then, import `deep_ep` in your Python project, and enjoy!
 
@@ -171,7 +160,6 @@ def dispatch_forward(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                                     allocate_on_comm_stream=previous_event is not None)
     # Do MoE dispatch
     # NOTES: the CPU will wait for GPU's signal to arrive, so this is not compatible with CUDA graph
-    # Unless you specify `num_worst_tokens`, but this flag is for intranode only
     # For more advanced usages, please refer to the docs of the `dispatch` function
     recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
         _buffer.dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights,
@@ -253,7 +241,7 @@ def get_buffer(group: dist.ProcessGroup, num_max_dispatch_tokens_per_rank: int, 
 
     # Allocate a buffer if not existed or not enough buffer size
     if _buffer is None or _buffer.group != group or not _buffer.low_latency_mode or _buffer.num_rdma_bytes < num_rdma_bytes:
-        # NOTES: for the best performance, the QP number **must** be equal to the number of the local experts
+        # NOTES: for best performance, the QP number **must** be equal to the number of the local experts
         assert num_experts % group.size() == 0
         _buffer = Buffer(group, 0, num_rdma_bytes, low_latency_mode=True, num_qps_per_rank=num_experts // group.size())
     return _buffer
@@ -287,7 +275,7 @@ def low_latency_combine(hidden_states: torch.Tensor,
     return combined_hidden_states, event_overlap, hook
 ```
 
-For two-micro-batch overlapping, you can refer to the following figure. With our receiving hook interface, the RDMA network traffic is happening in the background, without costing any GPU SMs from the computation part. But notice, the overlapped parts can be adjusted, i.e., the 4 parts of attention/dispatch/MoE/combine may not have the exact same execution time. You may adjust the stage settings according to your workload.
+For two micro-batch overlapping, you can refer to the following figure. With our receiving hook interface, the RDMA network traffics are happening in the background, without costing any GPU SMs from the computation part. But notice, the overlapped parts can be adjusted, i.e. the 4 parts of attention/dispatch/MoE/combine may not have the exact same execution time. You may adjust the stage settings according to your workload.
 
 ![low-latency](figures/low-latency.png)
 
@@ -295,20 +283,16 @@ For two-micro-batch overlapping, you can refer to the following figure. With our
 
 - [x] AR support
 - [x] Refactor low-latency mode AR code
-- [x] A100 support (intranode only)
+- [ ] A100 support (intranode only)
 - [x] Support BF16 for the low-latency dispatch kernel
-- [x] Support NVLink protocol for intranode low-latency kernels
-- [ ] TMA copy instead of LD/ST
-  - [x] Intranode kernels
-  - [ ] Internode kernels
-  - [ ] Low-latency kernels
-- [ ] SM-free kernels and refactors
+- [x] ~~Support NVLink protocol for intranode low-latency kernels~~ (conflict with hook-based overlapping)
+- [ ] SM-free normal kernels
 
 ## Notices
 
 #### Easier potential overall design
 
-The current DeepEP implementation uses queues for communication buffers which save memory but introduce complexity and potential deadlocks. If you're implementing your own version based on DeepEP, consider using fixed-size buffers allocated to maximum capacity for simplicity and better performance. For a detailed discussion of this alternative approach, see https://github.com/deepseek-ai/DeepEP/issues/39.
+Current DeepEP implementation uses queues for communication buffers which saves memory but introduces complexity and potential deadlocks. If you're implementing your own version based on DeepEP, consider using fixed-size buffers allocated to maximum capacity for simplicity and better performance. For a detailed discussion of this alternative approach, see https://github.com/deepseek-ai/DeepEP/issues/39.
 
 #### Undefined-behavior PTX usage
 
@@ -326,11 +310,11 @@ This code repository is released under [the MIT License](LICENSE), except for co
 
 ## Community Forks
 
-- [Infrawaves/DeepEP_ibrc_dual-ports_multiQP](https://github.com/Infrawaves/DeepEP_ibrc_dual-ports_multiQP) - Adds multi-QP solution and dual-port NIC support in IBRC transport
+- [Infrawaves/DeepEP_ibrc_dual-ports_multiQP](https://github.com/Infrawaves/DeepEP_ibrc_dual-ports_multiQP) - Adds multi-qp solution and dual-port NIC support in IBRC transport
 
 ## Citation
 
-If you use this codebase or otherwise find our work valuable, please cite:
+If you use this codebase, or otherwise found our work valuable, please cite:
 
 ```bibtex
 @misc{deepep2025,

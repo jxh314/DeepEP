@@ -266,85 +266,19 @@ __device__  __forceinline__ void st_na_global(const int4 *ptr, const int4& value
             ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
 }
 
-// TMA PTX instructions
-#ifndef DISABLE_SM90_FEATURES
-
-__device__ __forceinline__ void fence_view_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta; \n" :: );
-}
-
-__device__ __forceinline__ void fence_barrier_init() {
-    asm volatile("fence.mbarrier_init.release.cluster; \n" :: );
-}
-
-__device__ __forceinline__ void mbarrier_init(uint64_t* mbar_ptr, uint32_t arrive_count) {
-    auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
-    asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;" :: "r"(arrive_count), "r"(mbar_int_ptr));
-}
-
-__device__ __forceinline__ void mbarrier_wait(uint64_t* mbar_ptr, uint32_t& phase) {
-    auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
-    asm volatile("{\n\t"
-                 ".reg .pred       P1; \n\t"
-                 "LAB_WAIT: \n\t"
-                 "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2; \n\t"
-                 "@P1 bra DONE; \n\t"
-                 "bra     LAB_WAIT; \n\t"
-                 "DONE: \n\t"
-                 "}" :: "r"(mbar_int_ptr), "r"(phase), "r"(0x989680));
-    phase ^= 1;
-}
-
-__device__ __forceinline__ void mbarrier_arrive_and_expect_tx(uint64_t* mbar_ptr, int num_bytes) {
-    auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0; \n\t" :: "r"(num_bytes), "r"(mbar_int_ptr));
-}
-
-__device__ __forceinline__ void tma_store_fence() {
-    asm volatile ("fence.proxy.async.shared::cta;");
-}
-
-constexpr uint64_t kEvictFirst = 0x12f0000000000000;
-constexpr uint64_t kEvictNormal = 0x1000000000000000;
-
-__device__ __forceinline__ void tma_load_1d(const void* smem_ptr, const void* gmem_ptr, uint64_t* mbar_ptr, int num_bytes,
-                                            bool evict_first = true) {
-    auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
-    auto smem_int_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    const auto cache_hint = evict_first ? kEvictFirst : kEvictNormal;
-    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;\n"
-                 :: "r"(smem_int_ptr), "l"(gmem_ptr), "r"(num_bytes), "r"(mbar_int_ptr), "l"(cache_hint) : "memory");
-}
-
-__device__ __forceinline__ void tma_store_1d(const void* smem_ptr, const void* gmem_ptr, int num_bytes,
-                                             bool evict_first = true) {
-    auto smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    const auto cache_hint = evict_first ? kEvictFirst : kEvictNormal;
-    asm volatile("cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;\n"
-                 :: "l"(gmem_ptr), "r"(smem_int_ptr), "r"(num_bytes), "l"(cache_hint) : "memory");
-    asm volatile("cp.async.bulk.commit_group;");
-}
-
-template <int N = 0>
-__device__ __forceinline__ void tma_store_wait() {
-    asm volatile("cp.async.bulk.wait_group.read %0;" :: "n"(N) : "memory");
-}
-
-#endif
-
 template <typename dtype_t>
-__host__ __device__ dtype_t ceil_div(dtype_t a, dtype_t b) {
+__host__ __device__ dtype_t cell_div(dtype_t a, dtype_t b) {
     return (a + b - 1) / b;
 }
 
 template <typename dtype_t>
 __host__ __device__ dtype_t align(dtype_t a, dtype_t b) {
-    return ceil_div<dtype_t>(a, b) * b;
+    return cell_div<dtype_t>(a, b) * b;
 }
 
 __forceinline__ __device__ void get_channel_task_range(int num_tokens, int num_sms, int sm_id,
                                                        int& token_start_idx, int& token_end_idx) {
-    int num_tokens_per_sm = ceil_div(num_tokens, num_sms);
+    int num_tokens_per_sm = cell_div(num_tokens, num_sms);
     token_start_idx = min(num_tokens_per_sm * sm_id, num_tokens);
     token_end_idx = min(token_start_idx + num_tokens_per_sm, num_tokens);
 }
@@ -401,69 +335,44 @@ __forceinline__ __device__ int get_lane_id() {
     return lane_id;
 }
 
-constexpr float kFP8Margin = 1e-4;
-constexpr float kFinfoAmaxE4M3 = 448.0f;
-constexpr float kFinfoAmaxInvE4M3 = 1 / 448.0f;
-
-__forceinline__ __device__ float fast_pow2(int x) {
-    // We can ensure `-126 <= x and x <= 127`
-    uint32_t bits_x = (x + 127) << 23;
-    return *reinterpret_cast<float*>(&bits_x);
+template <int kNumRanks>
+__forceinline__ __device__ void move_fifo_slots(int &head) {
+    head = (head + kNumRanks) % NUM_MAX_FIFO_SLOTS;
 }
 
-__forceinline__ __device__ int fast_log2_ceil(float x) {
-    auto bits_x = *reinterpret_cast<uint32_t*>(&x);
-    auto exp_x = (bits_x >> 23) & 0xff;
-    auto man_bits = bits_x & ((1 << 23) - 1);
-    return exp_x - 127 + (man_bits != 0);
+template <int kNumRanks>
+__device__ __forceinline__ bool not_finished(int *task, int expected) {
+    auto result = false;
+    auto lane_id = threadIdx.x % 32;
+    if (lane_id < kNumRanks)
+        result = ld_volatile_global(task + lane_id) != expected;
+    return __any_sync(0xffffffff, result);
 }
 
-__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv, bool round_scale) {
-    if (round_scale) {
-        auto exp_scale_inv = fast_log2_ceil(amax * kFinfoAmaxInvE4M3);
-        scale = fast_pow2(-exp_scale_inv);
-        scale_inv = fast_pow2(exp_scale_inv);
-    } else {
-        scale_inv = amax * kFinfoAmaxInvE4M3;
-        scale = kFinfoAmaxE4M3 / amax;
-    }
-}
-
-template <bool kIsUE8M0, typename out_dtype_t = std::conditional_t<kIsUE8M0, uint8_t, float>>
-__forceinline__ __device__ out_dtype_t extract_required_scale_format(float value) {
-    if constexpr (kIsUE8M0) {
-        return static_cast<uint8_t>((*reinterpret_cast<uint32_t*>(&value)) >> 23);
-    } else {
-        return value;
+template <int kNumRanks>
+__forceinline__ __device__ void
+timeout_check(int **task_fifo_ptrs, int head, int rank, int expected, int tag = 0) {
+    auto start_time = clock64();
+    while (not_finished<kNumRanks>(task_fifo_ptrs[rank] + head, expected)) {
+        if (clock64() - start_time > NUM_TIMEOUT_CYCLES and threadIdx.x == 0) {
+            printf("DeepEP timeout check failed: %d (rank = %d)\n", tag, rank);
+            trap();
+        }
     }
 }
 
 template <int kNumRanks>
 __forceinline__ __device__ void
-barrier_block(int** barrier_signal_ptrs, int rank) {
+barrier_device(int **task_fifo_ptrs, int head, int rank, int tag = 0) {
     auto thread_id = static_cast<int>(threadIdx.x);
+    EP_DEVICE_ASSERT(kNumRanks <= 32);
 
-    // Add self-ranks, sub other ranks
     if (thread_id < kNumRanks) {
-        atomicAdd_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG);
+        atomicAdd_system(task_fifo_ptrs[rank] + head + thread_id, FINISHED_SUM_TAG);
         memory_fence();
-        atomicSub_system(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG);
+        atomicSub_system(task_fifo_ptrs[thread_id] + head + rank, FINISHED_SUM_TAG);
     }
-    EP_DEVICE_ASSERT(kNumRanks <= blockDim.x);
-
-    // Check timeout
-    auto start_time = clock64();
-    while (true) {
-        auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
-        if (__all_sync(0xffffffff, value <= 0))
-            break;
-
-        if (clock64() - start_time > NUM_TIMEOUT_CYCLES and get_lane_id() == 0) {
-            printf("DeepEP timeout check failed: rank = %d, thread = %d)\n", rank, thread_id);
-            trap();
-        }
-    }
-    __syncthreads();
+    timeout_check<kNumRanks>(task_fifo_ptrs, head, rank, 0, tag);
 }
 
 } // namespace deep_ep

@@ -7,7 +7,7 @@ from typing import Callable, List, Tuple, Optional, Union
 import deep_ep_cpp
 # noinspection PyUnresolvedReferences
 from deep_ep_cpp import Config, EventHandle
-from .utils import EventOverlap, check_nvlink_connections
+from .utils import EventOverlap
 
 
 class Buffer:
@@ -46,8 +46,7 @@ class Buffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
                  low_latency_mode: bool = False, num_qps_per_rank: int = 12,
-                 allow_nvlink_for_low_latency_mode: bool = True,
-                 allow_mnnvl: bool = False) -> None:
+                 allow_nvlink_for_low_latency_mode: bool = True) -> None:
         """
         Initialize the communication buffer.初始化通信缓冲区。 
 
@@ -62,7 +61,6 @@ class Buffer:
                 this is somehow incompatible with the hook-based overlapping.
                 Warning: PCIe connections may lead to errors due to memory ordering issues,
                 please make sure all connections are via NVLink.
-            allow_mnnvl: whether to allow MNNVL
 
         参数：
             group: 通信组。
@@ -71,7 +69,6 @@ class Buffer:
             low_latency_mode: 是否启用低延迟模式。
             num_qps_per_rank: 每个 RDMA rank 的 QP 数量，低延迟模式要求该值等于本地专家的数量。
         """
-        check_nvlink_connections(group)
 
         # Initialize the CPP runtime
         self.rank = group.rank()
@@ -106,18 +103,8 @@ class Buffer:
             os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
             # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
             os.environ['NVSHMEM_QP_DEPTH'] = '1024'
-
-            # Reduce gpu memory usage
-            # 6 default teams + 1 extra team
-            os.environ['NVSHMEM_MAX_TEAMS'] = '7'
-            # Disable NVLink SHArP
-            os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
             # NOTES: NVSHMEM initialization requires at least 256 MiB
             os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
-
-            if not allow_mnnvl:
-                # Disable multi-node NVLink detection
-                os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
 
             # Synchronize using the root ID
             nvshmem_unique_ids = [None, ] * self.group_size
@@ -131,10 +118,6 @@ class Buffer:
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
-
-    @staticmethod
-    def is_sm90_compiled():
-        return deep_ep_cpp.is_sm90_compiled()
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
@@ -204,10 +187,9 @@ class Buffer:
             config: the recommended config.
         """
 
-        # TODO: automatically tune
         config_map = {
-            2: Config(Buffer.num_sms, 24, 256, 6, 128),
-            4: Config(Buffer.num_sms, 6, 256, 6, 128),
+            2: Config(Buffer.num_sms, 16, 256, 6, 128),
+            4: Config(Buffer.num_sms, 16, 256, 6, 128),
             8: Config(Buffer.num_sms, 6, 256, 6, 128),
             16: Config(Buffer.num_sms, 16, 288, 20, 128),
             24: Config(Buffer.num_sms, 8, 288, 32, 128),
@@ -232,11 +214,10 @@ class Buffer:
             config: the recommended config.
         """
 
-        # TODO: automatically tune
         config_map = {
-            2: Config(Buffer.num_sms, 10, 256, 6, 128),
-            4: Config(Buffer.num_sms, 9, 256, 6, 128),
-            8: Config(Buffer.num_sms, 4, 256, 6, 128),
+            2: Config(Buffer.num_sms, 6, 256, 6, 128),
+            4: Config(Buffer.num_sms, 6, 256, 6, 128),
+            8: Config(Buffer.num_sms, 6, 256, 6, 128),
             16: Config(Buffer.num_sms, 2, 288, 28, 128),
             24: Config(Buffer.num_sms, 1, 288, 20, 128),
             32: Config(Buffer.num_sms, 1, 288, 20, 128),
@@ -286,8 +267,7 @@ class Buffer:
                  handle: Optional[Tuple] = None,
                  num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
                  is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
-                 topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None,
-                 expert_alignment: int = 1, num_worst_tokens: int = 0,
+                 topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None, expert_alignment: int = 1,
                  config: Optional[Config] = None,
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                  allocate_on_comm_stream: bool = False) -> \
@@ -314,8 +294,6 @@ class Buffer:
                 `-1` means no selections.
             topk_weights: `[num_tokens, num_topk]` with `torch.float`, the expert weights of each token to dispatch.
             expert_alignment: align the number of tokens received by each local expert to this variable.
-            num_worst_tokens: the worst number of tokens to receive, if specified, there will be no CPU sync, and it
-                will be CUDA-graph compatible. Please also notice that this flag is for intranode only.
             config: the performance tuning config.
             previous_event: the event to wait before actually executing the kernel.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
@@ -348,8 +326,7 @@ class Buffer:
             recv_topk_idx: received expert indices.
             recv_topk_weights: received expert weights.
             num_recv_tokens_per_expert_list: Python list shaped `[num_local_experts]`, the received token count by
-                each local expert, aligned to the input `expert_alignment`. If `num_worst_tokens` is specified, the list
-                will be empty.
+                each local expert, aligned to the input `expert_alignment`.
             handle: the returned communication handle.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
@@ -358,7 +335,6 @@ class Buffer:
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
-            assert num_worst_tokens == 0, 'Internode dispatch does not support `num_worst_tokens > 0`'
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                                            topk_idx, topk_weights, expert_alignment, config, previous_event, async_finish, allocate_on_comm_stream)
 
@@ -371,8 +347,7 @@ class Buffer:
             recv_x, recv_x_scales, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
                 x, x_scales, None, None,
                 None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
-                expert_alignment, num_worst_tokens, config,
-                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                expert_alignment, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
@@ -380,9 +355,8 @@ class Buffer:
                 num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, \
                 recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
                 self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
-                                                num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
-                                                expert_alignment, num_worst_tokens, config,
-                                                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                                      num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
+                                      expert_alignment, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(event)
 
@@ -534,16 +508,15 @@ class Buffer:
     # noinspection PyTypeChecker
     def low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
                              num_max_dispatch_tokens_per_rank: int, num_experts: int,
-                             cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
-                             use_fp8: bool = True, round_scale: bool = False, use_ue8m0: bool = False,
-                             async_finish: bool = False, return_recv_hook: bool = False) -> \
+                             use_fp8: bool = True, async_finish: bool = False, return_recv_hook: bool = False) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         A low-latency implementation for dispatching with IBGDA.
         This kernel requires all the ranks (no matter intranode or internode) should be visible via RDMA
             (specifically, IBGDA must be enabled).
-        Warning: as there are only two buffers, and the returned tensors reuse the buffer, you cannot hold more than 2
-            low-latency kernels' result tensors at a single moment.
+        Even for ranks in the same node, NVLink are fully disabled for simplicity.
+        Warning: as there are only two buffers, and the returned tensors reuse the buffer, you can not hold more than 2
+            low-latency kernels' result tensor at a single moment.
 
         Arguments:
             x: `torch.Tensor` with `torch.bfloat16`, shaped as `[num_tokens, hidden]`, only several hidden shapes are
@@ -552,47 +525,37 @@ class Buffer:
                 are supported. `-1` indices (not selecting any expert) are supported.
             num_max_dispatch_tokens_per_rank: the maximum number of tokens to dispatch, all the ranks must hold the same value.
             num_experts: the number of all experts.
-            cumulative_local_expert_recv_stats: a cumulative expert count tensor for statistics, which should have shape
-                `[num_local_experts]` and be typed as `torch.int`. This is useful for online service EP load balance
-                monitoring.
             use_fp8: whether to enable FP8 casting, with this, the received data will be a tuple of FP8 tensor and scaling factors.
-            round_scale: whether round the scaling factors into power of 2.
-            use_ue8m0: whether use UE8M0 as scaling factor format (available only with `round_scale=True`).
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             return_recv_hook: return a receiving hook if set. If set, the kernel will just do the RDMA request issues,
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
-                If you do not set this flag, the kernel will ensure the data's arrival.
+                If you not set this flag, the kernel will ensure the data's arrival.
 
         Returns:
             recv_x: a tensor or tuple with received tokens for each expert.
                 With `use_fp8=True`: the first element is a `torch.Tensor` shaped as
                 `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.float8_e4m3fn`.
                 The second tensor is the corresponding scales for the first element with shape
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 128]` with `torch.float`,
-                if `use_ue8m0=False`. With `use_ue8m0=True`, the second one is packed and shaped as
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 512]` with type `torch.int`.
+                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 128]` with `torch.float`.
                 Notice that, the last-two-dimension of the scaling tensors are in column-major for TMA compatibility.
                 With `use_fp8=False`, the result would be a tensor shaped as
                 `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.bfloat16`.
                 Moreover, not all tokens are valid, only some of the `num_max_dispatch_tokens_per_rank * num_ranks` are,
                 as we do not synchronize CPU received count with GPU (also not incompatible with CUDA graph if synced).
             recv_count: a tensor shaped `[num_local_experts]` with type `torch.int`, indicating how many tokens each
-                expert receives. As mentioned before, not all tokens are valid in `recv_x`.
+                expert receive. As mentioned before, not all tokens are valid in `recv_x`.
             handle: the communication handle to be used in the `low_latency_combine` function.
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
-                                              cumulative_local_expert_recv_stats,
                                               num_max_dispatch_tokens_per_rank, num_experts,
-                                              use_fp8, round_scale, use_ue8m0,
-                                              async_finish, return_recv_hook)
+                                              use_fp8, async_finish, return_recv_hook)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx,
                              packed_recv_x, packed_recv_x_scales, packed_recv_count,
-                             packed_recv_src_info, packed_recv_layout_range,
-                             cumulative_local_expert_recv_stats)
+                             packed_recv_src_info, packed_recv_layout_range)
         return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, \
             EventOverlap(event, tensors_to_record if async_finish else None), hook
 
@@ -605,8 +568,9 @@ class Buffer:
         A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
         This kernel requires all the ranks (no matter intranode or internode) should be visible via RDMA
             (specifically, IBGDA must be enabled).
-        Warning: as there are only two buffers, and the returned tensors reuse the buffer, you cannot hold more than 2
-            low-latency kernels' result tensors at a single moment.
+        Even for ranks in the same node, NVLink are fully disabled for simplicity.
+        Warning: as there are only two buffers, and the returned tensors reuse the buffer, you can not hold more than 2
+            low-latency kernels' result tensor at a single moment.
 
         Arguments:
             x: `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.bfloat16`,
@@ -622,7 +586,7 @@ class Buffer:
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             return_recv_hook: return a receiving hook if set. If set, the kernel will just do the RDMA request issues,
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
-                If you do not set this flag, the kernel will ensure the data's arrival.
+                If you not set this flag, the kernel will ensure the data's arrival.
             out: the in-place output tensor, if set, the kernel will write the result to this tensor and return it directly.
 
         Returns:
