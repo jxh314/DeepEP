@@ -72,6 +72,9 @@ class Buffer:
             num_rdma_bytes: 节点间（或低延迟模式下的节点内）RDMA 通信的缓冲区大小
             low_latency_mode: 是否启用低延迟模式。
             num_qps_per_rank: 每个 RDMA rank 的 QP 数量，低延迟模式要求该值等于本地专家的数量
+            allow_nvlink_for_low_latency_mode: 是否允许LL模式下的 NVLink 流量，这个选项和基于 hook 的 overlap（重叠）机制有一定不兼容性。
+                警告：如果存在 PCIe 连接，可能会因为内存顺序问题导致错误，因此请确保所有 GPU 之间的连接都是 NVLink。
+            allow_mnnvl: 是否允许 multi-node NVLink
         """
         check_nvlink_connections(group)
 
@@ -101,7 +104,7 @@ class Buffer:
         # 获取root的NVSHMEM的unique_id，然后同步它
         root_unique_id = None
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
-            # Enable IBGDA 
+            # Enable IBGDA for the low latency mode, which refers to "no package forwarding between NVLink and RDMA"
             assert num_qps_per_rank > 0
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
             os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
@@ -113,7 +116,7 @@ class Buffer:
             # Reduce gpu memory usage
             # 6 default teams + 1 extra team
             os.environ['NVSHMEM_MAX_TEAMS'] = '7'
-            # Disable NVLink SHArP
+            # Disable NVLink SHARP———— i wonder why
             os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
             # NOTES: NVSHMEM initialization requires at least 256 MiB
             os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
@@ -400,6 +403,7 @@ class Buffer:
 
         Arguments:
             x: `[num_tokens, hidden]` with `torch.bfloat16`, the tokens to send for reducing to its original ranks.
+            handle: 必须由dispatch取得
             handle: a must-set communication handle, you can obtain this from the dispatch function.
             topk_weights: `[num_tokens, num_topk]` with `torch.float`, the tokens' top-k weights for reducing to its original ranks.
             config: the performance tuning config.

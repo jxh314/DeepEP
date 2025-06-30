@@ -39,6 +39,11 @@ struct Config {
         this->num_max_rdma_chunked_recv_tokens = align<int>(num_max_rdma_chunked_recv_tokens, num_max_rdma_chunked_send_tokens);
         EP_HOST_ASSERT(num_max_rdma_chunked_send_tokens < num_max_rdma_chunked_recv_tokens);
         // NOTES: this assertion is related to RDMA lazy head update, we must ensure senders always have space to push
+        /* 生产者不是每次 push 都实时读取 head 指针，而是隔一段时间/隔一批数据才去读取一次 head。
+            这样可以减少对 head 指针的原子操作和远程同步（如 RDMA 原子读），降低通信和同步开销。
+            前提条件：发送端每次 push 的最大数据量（num_max_rdma_chunked_send_tokens）不能超过 buffer 容量的一半
+                    （num_max_rdma_chunked_recv_tokens / 2），这样即使 head 很久没更新，也不会覆盖未消费数据。
+        */
         EP_HOST_ASSERT(num_max_rdma_chunked_send_tokens <= num_max_rdma_chunked_recv_tokens / 2);
     }
 

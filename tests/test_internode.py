@@ -242,8 +242,8 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         print('', flush=True)
 
 
-# noinspection PyUnboundLocalVariable
 # （忽略）未绑定局部变量的检查
+# noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
     # 初始化分布式环境
     num_nodes = int(os.getenv('WORLD_SIZE', 1))

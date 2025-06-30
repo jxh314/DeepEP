@@ -150,13 +150,17 @@ void ibgda_submit_requests(nvshmemi_ibgda_device_qp_t *qp, uint64_t base_wqe_idx
     uint64_t new_wqe_idx = base_wqe_idx + num_wqes;
 
     // WQE writes must be finished first
+    // 保证所有 WQE 写入已完成（内存可见）
     __threadfence();
 
     // Wait for prior WQE slots to be filled first
+    // 等待前面的 WQE 槽位已被标记为 ready
+    // 确保只有前面的所有 WQE 都已经被填充/提交，当前这批 WQE 才能被“就绪”并提交到硬件
     auto *ready_idx = reinterpret_cast<unsigned long long int*>(&mvars->tx_wq.ready_head);
     while (atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx);
 
     // Always post, not in batch
+    // kAlwaysDoPostSend 为真时每次都 post，否则每 4 个批量 post
     constexpr int kNumRequestInBatch = 4;
     if (kAlwaysDoPostSend or (message_idx + 1) % kNumRequestInBatch == 0)
         ibgda_post_send(qp, new_wqe_idx);
@@ -413,20 +417,26 @@ __device__ static __forceinline__ void ibgda_write_amo_add_wqe(
 
 __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(void *rptr, const int& value, int pe, int qp_id, bool is_local_copy = false) {
     if (is_local_copy) {
+        // 如果是本地操作，直接用 CUDA 的 atomicAdd 实现原子加
         atomicAdd(static_cast<unsigned long long*>(rptr), value);
     } else {
+        // 获取目标节点的 RDMA QP（队列对）指针
         nvshmemi_ibgda_device_qp_t *qp = ibgda_get_rc(pe, qp_id);
 
         __be32 rkey;
         uint64_t raddr;
+        // 获取远端物理地址和 rkey
         ibgda_get_rkey(reinterpret_cast<uint64_t>(rptr), pe, &raddr, &rkey);
 
+        // 预留一个 WQE 槽位，用于后续写入原子操作描述
         uint64_t my_wqe_idx = ibgda_reserve_wqe_slots(qp, 1);
         void *wqe_ptrs = ibgda_get_wqe_ptr(qp, my_wqe_idx);
 
+        // 构造并写入一个 RDMA 原子加（atomic add）WQE（Work Queue Entry）
         ibgda_write_amo_add_wqe(qp, value, reinterpret_cast<uint64_t>(qp->ibuf.buf),
                                 qp->ibuf.lkey, raddr, rkey, my_wqe_idx, &wqe_ptrs);
 
+        // 提交这个原子加请求到网络，实际发起 RDMA 原子操作
         ibgda_submit_requests<true>(qp, my_wqe_idx, 1);
     }
 }

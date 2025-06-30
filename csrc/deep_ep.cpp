@@ -804,13 +804,18 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                  num_nvl_bytes, true, low_latency_mode);
     } else {
         // 否则，需要进行计算
+        // 每个channel要发往每个RDMA节点token数量的前缀和 (num_rdma_ranks, num_channels)
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
+        // 每个RDMA节点要接收的token数量 (num_rdma_ranks)
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+        // 每个channel要发往每个GPU的token数量的前缀和 (num_ranks, num_channels)，
         gbl_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
+        // 每个GPU要接收的token数量 (num_ranks)，
         recv_gbl_rank_prefix_sum = torch::empty({num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
 
         // Send sizes
-        *moe_recv_counter = -1, *moe_recv_rdma_counter = -1;
+        *moe_recv_counter = -1,       // int，总共要接收的token数量
+        *moe_recv_rdma_counter = -1;  // int[NUM_MAX_LOCAL_EXPERTS]，每个本地的expert要接收的token数量
         for (int i = 0; i < num_local_experts; ++ i)
             moe_recv_expert_counter[i] = -1;
         internode::notify_dispatch(num_tokens_per_rank->data_ptr<int>(), moe_recv_counter_mapped, num_ranks,
@@ -856,9 +861,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
     auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(), recv_x_scales = std::optional<torch::Tensor>();
     auto recv_src_meta = std::optional<torch::Tensor>();
-    // 形状(num_rdma_ranks, num_channels)，每个channel要发往每个RDMA节点token数量的前缀和
     auto recv_rdma_channel_prefix_matrix = std::optional<torch::Tensor>();
-    // 形状(num_ranks, num_channels)，每个channel要发往每个GPU的token数量的前缀和
     auto recv_gbl_channel_prefix_matrix = std::optional<torch::Tensor>();
     auto send_rdma_head = std::optional<torch::Tensor>();
     auto send_nvl_head = std::optional<torch::Tensor>();
@@ -906,6 +909,8 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                         comm_stream, num_channels, low_latency_mode);
 
     // Wait streams
+    // 如果是同步模式，则等待dispatch结束
+	// 如果是异步，则记录事件到comm_stream上
     std::optional<EventHandle> event;
     if (async) {
         event = EventHandle(comm_stream);
@@ -915,6 +920,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
+        // 再对其他一些tensor也执行record_stream
         for (auto& to: {x_scales, topk_idx, topk_weights,
                         num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert,
                         cached_rdma_channel_prefix_matrix, cached_recv_rdma_rank_prefix_sum,
