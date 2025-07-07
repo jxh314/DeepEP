@@ -72,6 +72,41 @@ __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(const nvshmem_tea
     kLowLatencyMode ? void(nvshmem_sync(rdma_team)) : nvshmem_sync_all();
 }
 
+/**
+ * @brief 分布式 EP 通信初始化与同步核函数
+ * 
+ * 主要功能：
+ * 1. 统计每个 rank、expert、RDMA rank 的 token 数量
+ * 2. 清理并初始化 RDMA/NVL 通信缓冲区
+ * 3. 通过 NVSHMEM 进行节点间/节点内同步
+ * 4. 计算并写入分发所需的前缀和矩阵，为后续数据分发做准备
+ * 
+ * @param num_tokens_per_rank         每个 rank 需要处理的 token 数
+ * @param moe_recv_counter_mapped     全局 token 统计同步指针
+ * @param num_ranks                   rank 总数
+ * @param num_tokens_per_rdma_rank    每个 RDMA rank 需要处理的 token 数
+ * @param moe_recv_rdma_counter_mapped RDMA token 统计同步指针
+ * @param num_tokens_per_expert       每个 expert 需要处理的 token 数
+ * @param moe_recv_expert_counter_mapped expert token 统计同步指针
+ * @param num_experts                 expert 总数
+ * @param is_token_in_rank            [num_tokens, num_ranks]，每个 token 是否分配到某个 rank
+ * @param num_tokens                  token 总数
+ * @param num_channels                通信 channel 数
+ * @param expert_alignment            expert 对齐参数
+ * @param rdma_clean_offset           RDMA 缓冲区清理起始偏移
+ * @param rdma_num_int_clean          RDMA 缓冲区清理长度
+ * @param nvl_clean_offset            NVL 缓冲区清理起始偏移
+ * @param nvl_num_int_clean           NVL 缓冲区清理长度
+ * @param rdma_channel_prefix_matrix  RDMA 通道前缀和矩阵
+ * @param recv_rdma_rank_prefix_sum   RDMA rank 前缀和
+ * @param gbl_channel_prefix_matrix   全局通道前缀和矩阵
+ * @param recv_gbl_rank_prefix_sum    全局 rank 前缀和
+ * @param rdma_buffer_ptr             RDMA 通信缓冲区指针
+ * @param buffer_ptrs                 NVL 通信缓冲区指针数组
+ * @param barrier_signal_ptrs         屏障信号指针数组
+ * @param rank                        当前进程 rank
+ * @param rdma_team                   NVSHMEM RDMA 通信组
+ */
 template <bool kLowLatencyMode, int kNumRDMARanks>
 __global__ void
 notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
@@ -93,10 +128,12 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
     auto num_rdma_experts = num_experts / kNumRDMARanks, num_nvl_experts = num_rdma_experts / NUM_MAX_NVL_PEERS;
 
     if (sm_id == 0) {
+        // 只用第0个SM来处理分布式通信的初始化和同步
         // Communication with others
         // Global barrier: the first warp does intra-node sync, the second warp does internode sync
         EP_DEVICE_ASSERT(num_warps > 1);
         EP_DEVICE_ASSERT(kNumRDMARanks <= num_threads);
+        // 1. 保证所有的 recv_buff 都已经初始化好，后续要开始同号卡 RDMA Token Meta 信息的发送。
         if (thread_id == 32)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
         barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
@@ -122,6 +159,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
             rdma_recv_num_tokens_mixed.send_buffer(thread_id)[NUM_MAX_NVL_PEERS + num_rdma_experts] = num_tokens_per_rdma_rank[thread_id];
         __syncthreads();
 
+        // 通过 NVSHMEM 进行 RDMA 通信
         // Issue send
         // TODO: more light fence or barrier or signaling
         // TODO: overlap EP barrier and NVL cleaning
@@ -144,6 +182,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
             nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank), 0);
 
         __syncthreads();
+        // 2. 保证所有节点同号卡发送完成，后续会 reduce 各节点发送到本专家的数据，计算各 channel 的范围。
         if (thread_id == 0)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
         __syncthreads();
@@ -228,10 +267,12 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
 
         // Finally barrier
         __syncthreads();
+        // 3. 保证所有节点channel 专家前缀、nvl_recv 计算完成。要开始准备发送数据后续调用 dispatch 发送会用到。
         if (thread_id == 32)
-            nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+            nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team); // here
         barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
     } else {
+        // 其他SM 负责计算分发布局元数据
         // Calculate meta data
         int dst_rdma_rank = sm_id - 1;
         for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
@@ -251,6 +292,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
             }
 
             // Warp reduce
+            // 一个 warp（线程束） 内的所有线程的 total_count 变量进行 归约求和（reduction sum）。
             total_count = warp_reduce_sum(total_count);
             #pragma unroll
             for (int i = 0; i < NUM_MAX_NVL_PEERS; ++ i)
@@ -336,7 +378,7 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
 
 template <bool kLowLatencyMode, int kNumRDMARanks, bool kCachedMode,
           int kNumDispatchRDMASenderWarps, int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
-__global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1)
+__global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1) // 7 + 1 + 8
 dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv_topk_weights, SourceMeta* recv_src_meta,
          const int4* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
          int* send_rdma_head, int* send_nvl_head,
@@ -371,7 +413,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         if (is_forwarder) {
         // forwarder负责 RDMA→NVLink 转发
             if (warp_id < NUM_MAX_NVL_PEERS) {
-                // 前 NUM_MAX_NVL_PEERS 个 warp 作为 RDMA+NVL forwarder
+                // 前 8 个 warp 作为 RDMA+NVL forwarder, target_rank 加上 channel_id 是为了均衡，不同 channel 的 warp 0 可能分到的数据量差异很大
                 return {WarpRole::kRDMAAndNVLForwarder, (warp_id + channel_id) % NUM_MAX_NVL_PEERS};
             } else {
                 // 剩下的warp是forwarder协调者（负责 forwarder 的进度同步和队列推进）
@@ -379,7 +421,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             }
         } else if (warp_id < kNumDispatchRDMASenderWarps) {
             // 非forwarder SM，前kNumDispatchRDMASenderWarps个warp 作为 RDMA sender
-            // 将token 数据写入 RDMA 通道
+            // 将token 数据写入RDMA send buffer
             return {WarpRole::kRDMASender, -1};
         } else if (warp_id == kNumDispatchRDMASenderWarps) {
             //下一个warp 作为RDMA sender协调者，负责统计和协调 RDMA sender 的发送进度，发起实际 RDMA 发送
@@ -438,22 +480,22 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     __shared__ volatile bool forward_channel_retired[NUM_MAX_NVL_PEERS];
     auto sync_forwarder_smem = []() { asm volatile("bar.sync 1, %0;" :: "r"((NUM_MAX_NVL_PEERS + 1) * 32)); };
 
-    // 负责将本channel 分配到的token 数据，按目标 RDMA rank 写入RDMA 通道缓冲区
+    // 负责将本channel分配到的token 数据，按目标RDMA rank 写入发送缓冲区
     if (warp_role == WarpRole::kRDMASender) {
-        // Get tasks
-        // 1. 计算本 warp 负责的 token 范围
+        // 1. 计算本channel负责的token范围
+        // Get tasks 
         int token_start_idx, token_end_idx;
         get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
-        // 2. 初始化共享内存中的队列指针
+        // 2. 只用第0个warp的部分线程初始化共享内存队列指针，避免多线程冲突
         // Clean shared memory
         EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA ranks");
         (warp_id == 0 and lane_id == 0) ? (rdma_send_next_token_idx = token_start_idx) : 0;
         (warp_id == 0 and lane_id < kNumRDMARanks) ? (rdma_send_channel_tail[lane_id] = 0) : 0;
         (warp_id == 0 and lane_id < kNumRDMARanks) ? (rdma_send_channel_next_tail[lane_id] = 0) : 0;
 
-        // Send number of tokens in this channel by `-value - 1`
         // 3. 发送本 channel 的 token 数量信息到 meta 区（用于后续同步）
+        // Send number of tokens in this channel by `-value - 1`
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
         for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
             auto dst_ptr = dst_rdma_rank == rdma_rank ? rdma_channel_meta.recv_buffer(dst_rdma_rank) : rdma_channel_meta.send_buffer(dst_rdma_rank);
@@ -480,28 +522,33 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         }
         sync_rdma_sender_smem();
 
-        // Iterate over tokens and copy into buffer
         // 5. 依次处理本 warp 负责的每个 token
+        // Iterate over tokens and copy into buffer
         int64_t token_idx;
         int cached_rdma_channel_head = 0, last_rdma_tail_idx = -1;
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
+        // 共7个 wrap, 每个 wrap 处理1个 token, 依此类推
         for (token_idx = token_start_idx + warp_id; token_idx < token_end_idx; token_idx += kNumDispatchRDMASenderWarps) {
             // Read RDMA rank existence
-            // 5.1 读取该 token 需要发送到哪些 RDMA rank（topk）
+            // 5.1 读取该 token 需要发送到哪些 RDMA rank
             uint64_t is_token_in_rank_uint64 = 0;
             if (lane_id < kNumRDMARanks)
+                // 将这 8 个 bool 作为一个 64 位整数整体读取，便于后续用位运算判断每个 NVL rank 是否需要发送。
                 is_token_in_rank_uint64 = *reinterpret_cast<const uint64_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS);
 
-            // Acquire sequential lock
             // 5.2 顺序锁，保证 token 顺序推进
+            // 一个warp对应一个token，所以这里warp0和warp1处理的两个
+            // token可能都会被发送到rdma_rank0，因此对send_ptr(0)的访问存在竞争，引入了一个顺序锁来保证原子性。
+            // Acquire sequential lock
             while (lane_id == 0 and rdma_send_next_token_idx != token_idx);
             __syncwarp();
 
             // Acquire next tail
-            // 5.3 获取下一个 tail（即写入槽位）
             int rdma_tail_idx = -1;
-            if (is_token_in_rank_uint64 != 0) {
-                rdma_tail_idx = rdma_send_channel_next_tail[lane_id] ++;
+            // 要发往此lane id 对应的rdma rank, uint64 保存了这个node 上的8个nvl rank是否需要发送。
+            if (is_token_in_rank_uint64 != 0) { 
+                // 更新tail
+                rdma_tail_idx = rdma_send_channel_next_tail[lane_id] ++; 
                 // 如果缓冲区满了，等待 head 推进
                 while (rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens)
                     cached_rdma_channel_head = static_cast<int>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
@@ -509,7 +556,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             __syncwarp();
 
             // Store RDMA head for combine
-            // 5.4 记录 head 信息（用于 combine 阶段）
             if (lane_id < kNumRDMARanks and not kCachedMode)
                 send_rdma_head[token_idx * kNumRDMARanks + lane_id] = rdma_tail_idx;
 
@@ -520,11 +566,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             last_rdma_tail_idx = rdma_tail_idx;
 
             // Release sequential lock
-            // 5.6 释放顺序锁
             lane_id == 0 ? (rdma_send_next_token_idx += 1) : 0;
 
             // Broadcast tails
-            // 5.7 广播 tails，准备多目标写入
+            // 5.6 广播 tails，准备多目标写入
             SourceMeta src_meta;
             int num_topk_ranks = 0, topk_ranks[kNumTopkRDMARanks];
             void* dst_send_buffers[kNumTopkRDMARanks];
@@ -536,6 +581,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 auto recv_is_token_in_rank_values = reinterpret_cast<const bool*>(&recv_is_token_in_rank_uint64);
                 if (lane_id == num_topk_ranks)
                     src_meta = SourceMeta(rdma_rank, recv_is_token_in_rank_values);
+                // 将第i个rdma_rank对应的fifo地址广播到dst_send_buffers。
                 dst_send_buffers[num_topk_ranks ++] = reinterpret_cast<uint8_t*>(broadcast(send_buffer, i)) + slot_idx * num_bytes_per_rdma_token;
             }
             EP_DEVICE_ASSERT(num_topk_ranks <= kNumTopkRDMARanks);
@@ -547,6 +593,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 for (int j = 0; j < num_topk_ranks; ++ j)
                     st_na_global(reinterpret_cast<int4*>(dst_send_buffers[j]) + key, value);
             };
+            // NROLLED_WARP_COPY就是一个warp将数据通过LD_FUNC从SRC读取到unrolled_values，然后通过ST_FUNC将unrolled_values写入DST。
+            // SRC就是用户的输入数据，LD_FUNC就是下边两个PTX中的一个，而ST_FUNC就是st_broadcast，就是将数据写入到dst_send_buffers的每个地址中。
             UNROLLED_WARP_COPY(5, lane_id, hidden_int4, 0, x + token_idx * hidden_int4, ld_nc_global, st_broadcast);
             #pragma unroll
             for (int i = 0; i < num_topk_ranks; ++ i)
@@ -585,7 +633,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
         // Epilogue
         // Acquire sequential lock
-        // 6. Epilogue：最后一个 token 的 tail 推进
+        /* 每个 token 的 tail 推进只能由它自己负责
+           在主循环中，每处理完一个 token，都会推进上一个 token 的 tail（last_rdma_tail_idx）。
+           但最后一个 token处理完后，没有下一个 token 来帮它推进 tail，所以需要在 epilogue 里单独处
+           理最后一个 token 的 tail，否则最后一个 token 的 tail 永远不会被推进，队列就卡住了。*/
         while (lane_id == 0 and rdma_send_next_token_idx != token_idx);
         __syncwarp();
 
@@ -594,7 +645,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             st_release_cta(const_cast<const int*>(rdma_send_channel_tail + lane_id), last_rdma_tail_idx + 1);
         __syncwarp(); 
 
-        // Release sequential lock 时序锁是干嘛的？？？
+        // Release sequential lock 
         lane_id == 0 ? (rdma_send_next_token_idx += 1) : 0;
     } else if (warp_role == WarpRole::kRDMASenderCoordinator) { 
         // 协调所有 RDMA sender 的发送进度，负责实际触发 RDMA 发送
@@ -606,8 +657,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         sync_rdma_sender_smem();
 
         // Get number of tokens to send for each RDMA rank
-        // 2. 统计每个 RDMA rank 需要发送的 token 数
-        // lane id 为 wrap 内线程 id
+        // 2. 统计每个 RDMA rank 需要发送的 token 数， lane id 为 wrap 内线程 id
         int num_tokens_to_send = 0;
         if (lane_id < kNumRDMARanks) {
             num_tokens_to_send = rdma_channel_prefix_matrix[lane_id * num_channels + channel_id];
@@ -647,11 +697,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 if (num_tokens_processed != synced_num_tokens_to_send and num_tokens_processed < num_max_rdma_chunked_send_tokens)
                     continue;
 
-                // 3.3 计算本次实际要下发的 token 数
                 // Issue RDMA send
                 auto num_tokens_to_issue = min(num_tokens_processed, num_max_rdma_chunked_send_tokens);
                 EP_DEVICE_ASSERT(num_tokens_to_issue >= 0 and num_tokens_to_issue <= synced_num_tokens_to_send);
-                // 3.4 触发 RDMA 发送
+                // 3.3 触发 RDMA 发送
                 if (dst_rdma_rank != rdma_rank) {
                     auto dst_slot_idx = synced_last_issued_tail % num_max_rdma_chunked_recv_tokens;
                     EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= num_max_rdma_chunked_recv_tokens);
@@ -678,13 +727,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 __syncwarp();
             }
         }
-    } else if (warp_role == WarpRole::kRDMAAndNVLForwarder) {
+    } else if (warp_role == WarpRole::kRDMAAndNVLForwarder) { // 8个wrap
         // RDMA consumers and NVL producers
         const auto dst_nvl_rank = target_rank;
         const auto dst_rank = rdma_rank * NUM_MAX_NVL_PEERS + dst_nvl_rank;
         const auto dst_rank_expert_begin = dst_rank * (num_experts / num_ranks);
         const auto dst_rank_expert_end = dst_rank_expert_begin + (num_experts / num_ranks);
 
+        // 1. 等待RDMA sender写入的meta信息到达，确定本NVL rank需要接收多少token
         // Wait counters to arrive
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
         EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
@@ -696,12 +746,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 auto meta_2 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2);
                 auto meta_3 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2 + 1);
                 if (meta_0 < 0 and meta_1 < 0 and meta_2 < 0 and meta_3 < 0) {
+                    // RDMA sender已写入meta，解析token范围
                     // Notify NVL ranks
                     int start_sum = -meta_0 - 1, end_sum = -meta_1 - 1;
                     EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
                     st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id, -start_sum - 1);
                     st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id, -end_sum - 1);
 
+                    // 记录本RDMA channel已接收token数
                     // Save RDMA channel received token count
                     src_rdma_channel_prefix = -meta_2 - 1;
                     auto src_rdma_channel_prefix_1 = -meta_3 - 1;
@@ -723,18 +775,21 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         }
         __syncwarp();
 
+        // 2. 移动NVL发送队列指针到本次转发的起始位置
         // Shift cached head
         send_nvl_head += src_rdma_channel_prefix * NUM_MAX_NVL_PEERS + dst_nvl_rank;
 
         // Wait shared memory to be cleaned
         sync_forwarder_smem();
 
+        // 3. 主循环：从RDMA缓冲区搬运token到NVL缓冲区
         // Forward tokens from RDMA buffer
         // NOTES: always start from the local rank
         int src_rdma_rank = sm_id % kNumRDMARanks;
         int cached_rdma_channel_head = 0, cached_rdma_channel_tail = 0;
         int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0, rdma_nvl_token_idx = 0;
         while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
+            // 4.1 检查NVL缓冲区是否有空位，否则等待
             // Check destination queue emptiness, or wait a buffer to be released
             start_time = clock64();
             while (lane_id == 0) {
@@ -752,6 +807,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             }
             __syncwarp();
 
+            // 4.2 轮询所有RDMA rank，找到有数据可搬运的源
             // Find next source RDMA rank (round-robin)
             start_time = clock64();
             while (true) {
@@ -773,6 +829,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             auto src_rdma_head = __shfl_sync(0xffffffff, cached_rdma_channel_head, src_rdma_rank);
             auto src_rdma_tail = __shfl_sync(0xffffffff, cached_rdma_channel_tail, src_rdma_rank);
 
+            // 4.3 遍历RDMA缓冲区的token，搬运到NVL缓冲区
             // Iterate over every token from the RDMA buffer
             for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++ i) {
                 auto rdma_slot_idx = i % num_max_rdma_chunked_recv_tokens;
@@ -826,6 +883,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     st_na_global(nvl_channel_topk_weights.buffer() + dst_slot_idx * num_topk + lane_id, weight_value);
                 }
 
+                // 如果NVL缓冲区满了，提前退出
                 // In case of insufficient NVL buffers, early stopping
                 if ((++ num_tokens_sent) == num_max_nvl_chunked_send_tokens)
                     src_rdma_tail = i + 1;
@@ -835,6 +893,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             if (lane_id == src_rdma_rank)
                 forward_channel_head[dst_nvl_rank][src_rdma_rank] = (cached_rdma_channel_head = src_rdma_tail);
 
+            // 4.7 推进NVL队列tail
             // Move tail index
             __syncwarp();
             if (lane_id == 0)
@@ -846,6 +905,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         if (lane_id == 0)
             forward_channel_retired[dst_nvl_rank] = true;
     } else if (warp_role == WarpRole::kForwarderCoordinator) {
+        // 多余的 warp 直接退出, only wrap 9's tatget_rank == 0  (warp_id - NUM_MAX_NVL_PEERS)
         // Extra warps for forwarder coordinator should exit directly
         if (target_rank > 0)
             return;
@@ -863,7 +923,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         sync_forwarder_smem();
 
         int last_head = 0, target_rdma = lane_id < kNumRDMARanks ? lane_id : 0;
-        while (true) {
+        while (true) { 
             // Find minimum head
             int min_head = std::numeric_limits<int>::max();
             #pragma unroll
@@ -873,6 +933,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 break;
 
             // Update remote head
+            // 只有当所有 forwarder 的最小 head 推进了一个chunk 时，才会原子推进 RDMA head，减少同步压力
+            // qp 拆开是不是说这里？channel_id + num_channels
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + num_max_rdma_chunked_send_tokens and lane_id < kNumRDMARanks) {
                 nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank), min_head - last_head,
                                                 translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank), channel_id + num_channels, lane_id == rdma_rank);
