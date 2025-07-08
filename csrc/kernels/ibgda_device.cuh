@@ -329,6 +329,26 @@ ibgda_write_empty_recv_wqe(void *out_wqe) {
     st_na_relaxed(reinterpret_cast<int4*>(data_seg_ptr), *reinterpret_cast<const int4*>(&data_seg));
 }
 
+/**
+ * @brief 以 CUDA warp 为单位，发起非阻塞 RDMA 写（put）操作
+ * 
+ * @tparam kAlwaysDoPostSend 是否每次都立即 post send（否则批量 post）
+ * @param req_rptr  远端目标地址（remote pointer）
+ * @param req_lptr  本地源地址（local pointer）
+ * @param bytes     需要写入的字节数
+ * @param dst_pe    目标进程/节点编号（RDMA rank）
+ * @param qp_id     目标 QP（队列对）编号
+ * @param lane_id   当前线程在 warp 内的编号（0~31）
+ * @param message_idx 消息序号（用于批量 post 控制）
+ * 
+ * 主要流程：
+ * 1. 计算本地和远端的 lkey/rkey 及物理地址，支持大块数据分多次搬运
+ * 2. 每个 lane 负责搬运一段 chunk，保证并行高效
+ * 3. 构造 RDMA write 的 WQE（Work Queue Entry），写入发送队列
+ * 4. 由 lane 0 负责提交（post send），实现非阻塞、批量、高吞吐
+ * 
+ * 适用于 GPU 上高性能分布式通信，warp 级别并发搬运数据到远端
+ */
 template <bool kAlwaysDoPostSend = false>
 __device__ static __forceinline__ void
 nvshmemi_ibgda_put_nbi_warp(uint64_t req_rptr, uint64_t req_lptr, size_t bytes, int dst_pe, int qp_id, int lane_id, int message_idx) {

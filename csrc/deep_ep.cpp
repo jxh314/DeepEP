@@ -208,14 +208,11 @@ void Buffer::sync(const std::vector<int> &device_ids,
         CUDA_CHECK(cudaMemcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaDeviceSynchronize());
     }
-
     /*
-    如果需要机间通信，则
-
-    初始化nvshmem：internode::init(...)，内部调用
+    如果需要机间通信，则初始化nvshmem：internode::init(...)，内部调用
         - nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
         - nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
-        这里对于非low_latency模式，每个nvshmem的通信组是所有 rdma rank 上 nvl rank 相同的GPU，即通信组数量为nvl rank数量，
+        这里对于非low_latency模式，每个nvshmem的通信组是所有rdma rank 上nvl rank 相同的GPU，即通信组数量为nvl rank数量，
         每个通信组的大小为rdma rank的数量，每个通信组的root位于rdma rank=0的节点上。
         若4机32卡，则有8个（nvl ranks）通信组,大小为4
     */
@@ -234,14 +231,12 @@ void Buffer::sync(const std::vector<int> &device_ids,
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
         internode::barrier();
 
-        // Allocate
-
         /*
-        创建NVSHMEM的共享内存指针rdma_buffer_ptr，内部是
-             - nvshmem_align(alignment, size);
-             此后，所有GPU可以用rdma_buffer_ptr来创建共享的buffer，然后使用nvshmem进行通信
+        创建NVSHMEM的共享内存指针 rdma_buffer_ptr，内部是 nvshmem_align(alignment, size);
+        此后，所有GPU可以用 rdma_buffer_ptr 来创建共享的buffer，然后使用nvshmem进行通信
         至此初始化部分就完成了。
         */
+        // Allocate
         rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
 
         // Clean buffer (mainly for low-latency mode)

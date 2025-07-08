@@ -376,9 +376,10 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
     return num_rdma_ranks < 8 ? num_rdma_ranks : 8;
 }
 
+// 7 + 1 + 8 个 warp
 template <bool kLowLatencyMode, int kNumRDMARanks, bool kCachedMode,
           int kNumDispatchRDMASenderWarps, int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
-__global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1) // 7 + 1 + 8
+__global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1)
 dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv_topk_weights, SourceMeta* recv_src_meta,
          const int4* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
          int* send_rdma_head, int* send_nvl_head,
@@ -727,7 +728,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 __syncwarp();
             }
         }
-    } else if (warp_role == WarpRole::kRDMAAndNVLForwarder) { // 8个wrap
+    } else if (warp_role == WarpRole::kRDMAAndNVLForwarder) { 
+        // 8个wrap
         // RDMA consumers and NVL producers
         const auto dst_nvl_rank = target_rank;
         const auto dst_rank = rdma_rank * NUM_MAX_NVL_PEERS + dst_nvl_rank;
