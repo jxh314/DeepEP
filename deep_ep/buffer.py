@@ -29,10 +29,6 @@ class Buffer:
 
     ''' 
     Mixture of Experts (MoE) 模型的核心专家并行 (EP) 通信缓冲区，支持以下功能：
-        - 高吞吐量的节点内 all-to-all 通信（分发和合并，使用 NVLink）
-        - 高吞吐量的节点间 all-to-all 通信（分发和合并，使用 RDMA 和 NVLink）
-        - 低延迟的 all-to-all 通信（分发和合并，使用 RDMA）
-    
     Attributes:
         num_sms: 用于高吞吐量内核的 SM 数量。
         rank: 本地的 rank 编号。
@@ -104,7 +100,7 @@ class Buffer:
         # 获取root的NVSHMEM的unique_id，然后同步它
         root_unique_id = None
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
-            # Enable IBGDA for the low latency mode, which refers to "no package forwarding between NVLink and RDMA"
+            # Enable IBGDA
             assert num_qps_per_rank > 0
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
             os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
