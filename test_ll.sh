@@ -3,14 +3,12 @@
 # export LD_LIBRARY_PATH=/workspace:/usr/local/nvshmem/lib:${LD_LIBRARY_PATH}
 export LD_LIBRARY_PATH=/usr/local/nvshmem/lib:${LD_LIBRARY_PATH}
 # export LD_PRELOAD=/workspace/libnccl.so.2.25.1 
-export LD_PRELOAD=/ssd1/jinxihua/bccl/bccl_gcc8.2/build/lib/libnccl.so.2.26.5 
 
-export NVSHMEM_HCA_LIST=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1
-export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=xgbe0
+export NVSHMEM_HCA_LIST=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=eth0
 export NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY=AF_INET
 export NVSHMEM_IB_GID_INDEX=3
 export NVSHMEM_DISABLE_P2P=true
-export NVSHMEM_IBGDA_NUM_RC_PER_PE=1
 export NVSHMEM_IB_ENABLE_IBGDA=true
 export NVSHMEM_SYMMETRIC_HEAP_SIZE=32G
 
