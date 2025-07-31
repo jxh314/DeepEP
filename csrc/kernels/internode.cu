@@ -790,7 +790,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                         int expected_bitmap_idx = chunk_id % num_chunks_per_buffer;
                         while (cached_rdma_channel_bitmap[expected_bitmap_idx] == 1ULL) {
                             cached_rdma_channel_tail += num_max_rdma_chunked_send_tokens;
-                            st_relaxed_sys_global(rdma_channel_bitmap.buffer(src_rdma_rank) + expected_bitmap_idx * 8, 0ULL);
+                            st_relaxed_sys_global(reinterpret_cast<int*>(rdma_channel_bitmap.buffer(src_rdma_rank) + expected_bitmap_idx * 8), 0ULL);
                             // atomicCAS(static_cast<unsigned long long*>(rdma_channel_bitmap.buffer(src_rdma_rank) + expected_bitmap_idx * 8), 1ULL, 0ULL);
                             cached_rdma_channel_bitmap[expected_bitmap_idx] = 0ULL;
                             expected_bitmap_idx = (expected_bitmap_idx + 1) % num_chunks_per_buffer;
@@ -1789,7 +1789,7 @@ combine(int4* combined_x, float* combined_topk_weights,
                     int expected_bitmap_idx = chunk_id % num_chunks_per_buffer;
                     while (cached_rdma_channel_bitmap[expected_bitmap_idx] == 1ULL) {
                         cached_channel_tail_idx += num_max_rdma_chunked_send_tokens;
-                        st_relaxed_sys_global(rdma_channel_bitmap.buffer(lane_id) + expected_bitmap_idx * 8, 0ULL);
+                        st_relaxed_sys_global(reinterpret_cast<int*>(rdma_channel_bitmap.buffer(lane_id) + expected_bitmap_idx * 8), 0ULL);
                         // atomicCAS(static_cast<unsigned long long*>(rdma_channel_bitmap.buffer(lane_id) + expected_bitmap_idx * 8), 1ULL, 0ULL);
                         cached_rdma_channel_bitmap[expected_bitmap_idx] = 0ULL;
                         expected_bitmap_idx = (expected_bitmap_idx + 1) % num_chunks_per_buffer;
