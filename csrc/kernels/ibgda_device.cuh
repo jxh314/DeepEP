@@ -441,10 +441,10 @@ __device__ static __forceinline__ void ibgda_write_amo_add_wqe(
 
 __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(void *rptr, const int& value, int pe, int qp_id, bool is_local_copy = false) {
     if (is_local_copy) {
-        // 如果是本地操作，直接用 CUDA 的 atomicAdd 实现原子加
+        // 本地操作，直接用 CUDA 的 atomicAdd 实现原子加
         atomicAdd(static_cast<unsigned long long*>(rptr), value);
     } else {
-        // 获取发往目标pe的 QP 指针
+        // 获取发往目标pe的 QP 
         nvshmemi_ibgda_device_qp_t *qp = ibgda_get_rc(pe, qp_id);
 
         __be32 rkey;
@@ -456,7 +456,7 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(void *rptr, cons
         uint64_t my_wqe_idx = ibgda_reserve_wqe_slots(qp, 1);
         void *wqe_ptrs = ibgda_get_wqe_ptr(qp, my_wqe_idx);
 
-        // 构造并写入一个 RDMA 原子加（atomic add）WQE（Work Queue Entry）
+        // 构造并写入一个 RDMA atomic add 的WQE（Work Queue Entry）
         ibgda_write_amo_add_wqe(qp, value, reinterpret_cast<uint64_t>(qp->ibuf.buf),
                                 qp->ibuf.lkey, raddr, rkey, my_wqe_idx, &wqe_ptrs);
 
