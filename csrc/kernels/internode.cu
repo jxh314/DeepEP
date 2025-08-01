@@ -646,7 +646,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         while (__any_sync(0xffffffff, num_tokens_to_send > 0)) {
             // Timeout check
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
-                printf("DeepEP RDMA sender coordinator timeout, channel: %d, IB: %d, nvl %d, dst IB: %d, tail: %d, remaining: %d\n",
+                printf("DeepEP RDMA sender coordinator timeout, channel: %d, IB: %d, nvl: %d, dst IB: %d, tail: %d, remaining: %d\n",
                        channel_id, rdma_rank, nvl_rank, lane_id, last_issued_tail, num_tokens_to_send);
                 trap();
             }
@@ -783,13 +783,17 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                         // cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
 
                         // load bitmap, abondon rdma_channel_tail
+                        printf("DeepEP dispatch forwarder bitmap: \n");
                         for (int i = 0; i < num_chunks_per_buffer; ++i) {
                             cached_rdma_channel_bitmap[i] = static_cast<int>(ld_acquire_sys_global(rdma_channel_bitmap.buffer(src_rdma_rank) + i * 8));
+                            printf("bitmap[%d] = %d, ", i, cached_rdma_channel_bitmap[i]);
                         }
                         int chunk_id = cached_rdma_channel_tail / num_max_rdma_chunked_send_tokens;
                         int expected_bitmap_idx = chunk_id % num_chunks_per_buffer;
+                        printf("expected bitmap_idx: %d, chunk_id: %d\n", expected_bitmap_idx, chunk_id);
                         while (cached_rdma_channel_bitmap[expected_bitmap_idx] == 1ULL) {
                             cached_rdma_channel_tail += num_max_rdma_chunked_send_tokens;
+                            printf("DeepEP dispatch forwarder : cached_rdma_channel_tail");
                             st_relaxed_sys_global(reinterpret_cast<int*>(rdma_channel_bitmap.buffer(src_rdma_rank) + expected_bitmap_idx * 8), 0ULL);
                             // atomicCAS(static_cast<unsigned long long*>(rdma_channel_bitmap.buffer(src_rdma_rank) + expected_bitmap_idx * 8), 1ULL, 0ULL);
                             cached_rdma_channel_bitmap[expected_bitmap_idx] = 0ULL;
