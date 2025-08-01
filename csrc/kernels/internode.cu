@@ -694,7 +694,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     // nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
                     //                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id, dst_rdma_rank == rdma_rank);
                     auto dst_bitmap_idx = chunk_id % num_chunks_per_buffer;
-                    const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_channel_bitmap.buffer(rdma_rank)) + dst_bitmap_idx * 8;
+                    const auto dst_ptr = rdma_channel_bitmap.buffer(rdma_rank) + dst_bitmap_idx * 8;
                     nvshmemi_ibgda_amo_nonfetch_add(dst_ptr, 1, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), 
                                                     qp_id, dst_rdma_rank == rdma_rank);
                 }
@@ -1738,7 +1738,7 @@ combine(int4* combined_x, float* combined_topk_weights,
                     __syncwarp();
                     if (lane_id == 0) {
                         auto dst_bitmap_idx = chunk_id % num_chunks_per_buffer;
-                        const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_channel_bitmap.buffer(rdma_rank)) + dst_bitmap_idx * 8;
+                        const auto dst_ptr = rdma_channel_bitmap.buffer(rdma_rank) + dst_bitmap_idx * 8;
                         nvshmemi_ibgda_amo_nonfetch_add(dst_ptr, 1, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), 
                                                         qp_id, dst_rdma_rank == rdma_rank);
                         // nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_chunked_tokens,
