@@ -754,7 +754,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         int src_rdma_rank = sm_id % kNumRDMARanks;
         int cached_rdma_channel_head = 0, cached_rdma_channel_tail = 0;
         int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0, rdma_nvl_token_idx = 0;
-        uint64_t cached_rdma_channel_bitmap[num_chunks_per_buffer];
+        int cached_rdma_channel_bitmap[128/*max_chunks_in_rdmaBuffer*/];
         memset(cached_rdma_channel_bitmap, 0, sizeof(cached_rdma_channel_bitmap));
         while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
             // Check destination queue emptiness, or wait a buffer to be released
@@ -784,7 +784,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
                         // load bitmap, abondon rdma_channel_tail
                         for (int i = 0; i < num_chunks_per_buffer; ++i) {
-                            cached_rdma_channel_bitmap[i] = static_cast<uint64_t>(ld_acquire_sys_global(rdma_channel_bitmap.buffer(src_rdma_rank) + i * 8));
+                            cached_rdma_channel_bitmap[i] = static_cast<int>(ld_acquire_sys_global(rdma_channel_bitmap.buffer(src_rdma_rank) + i * 8));
                         }
                         int chunk_id = cached_rdma_channel_tail / num_max_rdma_chunked_send_tokens;
                         int expected_bitmap_idx = chunk_id % num_chunks_per_buffer;
@@ -1765,7 +1765,7 @@ combine(int4* combined_x, float* combined_topk_weights,
 
             // Iterate over all tokens and combine
             int cached_channel_tail_idx = 0;
-            uint64_t cached_rdma_channel_bitmap[num_chunks_per_buffer];
+            int cached_rdma_channel_bitmap[128/*max chunks in rdmaBuffer*/];
             memset(cached_rdma_channel_bitmap, 0, sizeof(cached_rdma_channel_bitmap));
             for (int64_t token_idx = token_start_idx + warp_id; token_idx < token_end_idx; token_idx += kNumRDMAReceivers) {
                 // Read expected head
@@ -1783,7 +1783,7 @@ combine(int4* combined_x, float* combined_topk_weights,
                     
                     // load bitmap, abondon rdma_channel_tail
                     for (int i = 0; i < num_chunks_per_buffer; ++i) {
-                        cached_rdma_channel_bitmap[i] = static_cast<uint64_t>(ld_acquire_sys_global(rdma_channel_bitmap.buffer(lane_id) + i * 8));
+                        cached_rdma_channel_bitmap[i] = static_cast<int>(ld_acquire_sys_global(rdma_channel_bitmap.buffer(lane_id) + i * 8));
                     }
                     int chunk_id = cached_channel_tail_idx / num_max_rdma_chunked_send_tokens;
                     int expected_bitmap_idx = chunk_id % num_chunks_per_buffer;
