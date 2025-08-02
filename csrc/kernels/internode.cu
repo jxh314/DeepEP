@@ -791,7 +791,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                         }
                         int chunk_id = cached_rdma_channel_tail / num_max_rdma_chunked_send_tokens;
                         int expected_bitmap_idx = chunk_id % num_chunks_per_buffer;
-                        if(lane_id == 0 and channel_id ==0 and nvl_rank==0) {
+                        if(lane_id == 0 and channel_id ==0 and nvl_rank==0 and cached_rdma_channel_bitmap[expected_bitmap_idx] == 1) {
                             printf("rdma_channel_bitmap: rdma_rank: %d, src_rdma_rank: %d, num_chunks_per_buffer: %d, expected bitmap_idx: %d, chunk_id: %d, cached_rdma_channel_tail: %d\n", 
                                     rdma_rank, src_rdma_rank, num_chunks_per_buffer, expected_bitmap_idx, chunk_id, cached_rdma_channel_tail);
                             for(int i = 0; i < num_chunks_per_buffer; ++i) {
