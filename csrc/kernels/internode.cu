@@ -695,9 +695,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     //                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id, dst_rdma_rank == rdma_rank);
                     auto dst_bitmap_idx = chunk_id % num_chunks_per_buffer;
                     const auto dst_ptr = rdma_channel_bitmap.buffer(rdma_rank) + dst_bitmap_idx;
-                    if(channel_id == 0 and nvl_rank == 0) {
-                        printf("DeepEP dispatch senderCoordinator, dst_ptr= %p, chunk_id=%d, dst_bitmap_idx=%d, rdma_rank=%d dst_rdma_rank=%d \n",dst_ptr, chunk_id, dst_bitmap_idx, rdma_rank, dst_rdma_rank);
-                    }
+                    // if(channel_id == 0 and nvl_rank == 0) {
+                    //     printf("DeepEP dispatch senderCoordinator, dst_ptr= %p, chunk_id=%d, dst_bitmap_idx=%d, rdma_rank=%d dst_rdma_rank=%d \n",dst_ptr, chunk_id, dst_bitmap_idx, rdma_rank, dst_rdma_rank);
+                    // }
                     nvshmemi_ibgda_amo_nonfetch_add(dst_ptr, 1, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), 
                                                     qp_id, dst_rdma_rank == rdma_rank);
                 }
@@ -789,16 +789,16 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                         for (int i = 0; i < num_chunks_per_buffer; ++i) {
                             cached_rdma_channel_bitmap[i] = static_cast<int>(ld_acquire_sys_global(rdma_channel_bitmap.buffer(src_rdma_rank) + i));
                         }
-                        if(lane_id == 0) {
-                            if(channel_id == 0 and nvl_rank == 0) {
-                                printf("rdma_channel_bitmap: src_rdma_rank: %d, channel_id: %d, num_chunks_per_buffer: %d\n", src_rdma_rank, channel_id, num_chunks_per_buffer);
-                                for(int i = 0; i < num_chunks_per_buffer; ++i) printf("[%d],", cached_rdma_channel_bitmap[i]);
-                                printf("\n");
-                            }
-                        }
                         int chunk_id = cached_rdma_channel_tail / num_max_rdma_chunked_send_tokens;
                         int expected_bitmap_idx = chunk_id % num_chunks_per_buffer;
-                        if(lane_id == 0 and channel_id ==0 and nvl_rank==0) printf("expected bitmap_idx: %d, chunk_id: %d\n", expected_bitmap_idx, chunk_id);
+                        if(lane_id == 0 and channel_id ==0 and nvl_rank==0) {
+                            printf("rdma_channel_bitmap: rdma_rank: %d, src_rdma_rank: %d, num_chunks_per_buffer: %d, expected bitmap_idx: %d, chunk_id: %d, cached_rdma_channel_tail: %d\n", 
+                                    rdma_rank, src_rdma_rank, num_chunks_per_buffer, expected_bitmap_idx, chunk_id, cached_rdma_channel_tail);
+                            for(int i = 0; i < num_chunks_per_buffer; ++i) {
+                                printf("[%d],", cached_rdma_channel_bitmap[i]);
+                                if(i == num_chunks_per_buffer - 1) printf("\n");
+                            }
+                        }
                         while (cached_rdma_channel_bitmap[expected_bitmap_idx] == 1) {
                             cached_rdma_channel_tail += num_max_rdma_chunked_send_tokens;
                             // uint64t* 使用 int* 来写有无问题？
