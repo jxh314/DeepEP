@@ -697,6 +697,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     const auto dst_ptr = rdma_channel_bitmap.buffer(rdma_rank) + dst_bitmap_idx * 8;
                     if(channel_id == 0 and nvl_rank == 0) {
                         printf("DeepEP dispatch senderCoordinator, dst_ptr= %p, chunk_id=%d, rdma_rank=%d dst_rdma_rank=%d \n",dst_ptr, chunk_id, rdma_rank, dst_rdma_rank);
+                        printf("DeepEP dispatch senderCoordinator, dst_bitmap_idx=%d, channel_bitmap.buffer(rdma_rank)=%p, dst_bitmap_idx*8=%d\n", dst_bitmap_idx, rdma_channel_bitmap.buffer(rdma_rank), dst_bitmap_idx*8);
                     }
                     nvshmemi_ibgda_amo_nonfetch_add(dst_ptr, 1, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), 
                                                     qp_id, dst_rdma_rank == rdma_rank);
