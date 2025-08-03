@@ -232,7 +232,11 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
     num_sms = 24
-    num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
+    # 0:禁用, 1:启用双QP轮转
+    round_robin = int(os.getenv('ROUND_ROBIN', 0))
+    # 2 qp for data transfer, 1 qp for head update
+    num_qps_per_rank = num_sms if round_robin == 0 else num_sms // 2 * 3
+    num_qps_per_rank = max(num_qps_per_rank, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
 
     buffer = deep_ep.Buffer(group, int(2e9), int(1e9), low_latency_mode=args.test_ll_compatibility,
                             num_qps_per_rank=num_qps_per_rank, explicitly_destroy=True)
