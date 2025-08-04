@@ -691,17 +691,16 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 if (lane_id == dst_rdma_rank) {
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue; 
-                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
-                                                    translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
+                    // nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
+                    //                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
                     
                     auto dst_bitmap_idx = chunk_id % num_chunks_per_buffer;
                     const auto dst_ptr = rdma_channel_bitmap.buffer(rdma_rank) + dst_bitmap_idx;
                     // if(channel_id == 0 and nvl_rank == 0) {
                     //     printf("DeepEP dispatch senderCoordinator, dst_ptr= %p, chunk_id=%d, dst_bitmap_idx=%d, rdma_rank=%d dst_rdma_rank=%d \n",dst_ptr, chunk_id, dst_bitmap_idx, rdma_rank, dst_rdma_rank);
                     // }
-                    // 看起来是这里的问题，每次不应该加1，而应该加上num_tokens_to_issue，这个不一定是chunk的大小
-                    // nvshmemi_ibgda_amo_nonfetch_add(dst_ptr, num_tokens_to_issue, 
-                    //                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id, dst_rdma_rank == rdma_rank);                                                 
+                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_bitmap.buffer(rdma_rank) + 0, num_tokens_to_issue, 
+                                                    translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id, dst_rdma_rank == rdma_rank);                                                 
                 }
                 __syncwarp();
             }
@@ -786,8 +785,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail) {
-                        cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
-                        // cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_bitmap.buffer(src_rdma_rank)));
+                        // cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                        cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_bitmap.buffer(src_rdma_rank) + 0));
 
                         // load bitmap, abondon rdma_channel_tail
                         // for (int i = 0; i < num_chunks_per_buffer; ++i) {
@@ -795,14 +794,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                         // }
                         // int chunk_id = cached_rdma_channel_tail / num_max_rdma_chunked_send_tokens;
                         // int expected_bitmap_idx = chunk_id % num_chunks_per_buffer;
-                        // // if(lane_id == 0 and channel_id ==0 and nvl_rank==0 and cached_rdma_channel_bitmap[expected_bitmap_idx] == 1) {
-                        //     // printf("rdma_channel_bitmap: rdma_rank: %d, src_rdma_rank: %d, num_chunks_per_buffer: %d, expected bitmap_idx: %d, chunk_id: %d, cached_rdma_channel_tail: %d\n", 
-                        //     //         rdma_rank, src_rdma_rank, num_chunks_per_buffer, expected_bitmap_idx, chunk_id, cached_rdma_channel_tail);
-                        //     // for(int i = 0; i < num_chunks_per_buffer; ++i) {
-                        //     //     printf("[%d],", cached_rdma_channel_bitmap[i]);
-                        //     //     if(i == num_chunks_per_buffer - 1) printf("\n");
-                        //     // }
-                        // // }
+                        // if(lane_id == 0 and channel_id ==0 and nvl_rank==0 and cached_rdma_channel_bitmap[expected_bitmap_idx] == 1) {
+                            // printf("rdma_channel_bitmap: rdma_rank: %d, src_rdma_rank: %d, num_chunks_per_buffer: %d, expected bitmap_idx: %d, chunk_id: %d, cached_rdma_channel_tail: %d\n", 
+                            //         rdma_rank, src_rdma_rank, num_chunks_per_buffer, expected_bitmap_idx, chunk_id, cached_rdma_channel_tail);
+                            // for(int i = 0; i < num_chunks_per_buffer; ++i) {
+                            //     printf("[%d],", cached_rdma_channel_bitmap[i]);
+                            //     if(i == num_chunks_per_buffer - 1) printf("\n");
+                            // }
+                        // }
                         // while (new_rdma_channel_bitmap[expected_bitmap_idx] - cached_rdma_channel_bitmap[expected_bitmap_idx] > 0) {
                         //     cached_rdma_channel_tail += new_rdma_channel_bitmap[expected_bitmap_idx] - cached_rdma_channel_bitmap[expected_bitmap_idx];
                         //     // uint64t* 使用 int* 来写有无问题？
@@ -813,9 +812,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                         // }     
                     }
                     if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank)){
-                        if(lane_id == 0 and channel_id == 0 and nvl_rank == 0 and warp_id == 0) {
-                            printf("DeepEP dispatch forwarder get data, cached_rdma_channel_tail: %d, cached_rdma_channel_head: %d\n", cached_rdma_channel_tail, cached_rdma_channel_head);
-                        }
+                        // if(lane_id == 0 and channel_id == 0 and nvl_rank == 0 and warp_id == 0) {
+                        //     printf("DeepEP dispatch forwarder get data, cached_rdma_channel_tail: %d, cached_rdma_channel_head: %d\n", cached_rdma_channel_tail, cached_rdma_channel_head);
+                        // }
                         break;
                     }
                 }
