@@ -692,8 +692,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 if (lane_id == dst_rdma_rank) {
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue; 
-                    // nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
-                    //                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
+                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
+                                                    translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
                     
                     auto dst_bitmap_idx = chunk_id % num_chunks_per_buffer;
                     const auto dst_ptr = rdma_channel_bitmap.buffer(rdma_rank) + dst_bitmap_idx;
@@ -703,8 +703,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     // nvshmemi_ibgda_amo_nonfetch_add(dst_ptr, 1, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), 
                     //                                 qp_id, dst_rdma_rank == rdma_rank); 
                     // 看起来是这里的问题，每次不应该加1，而应该加上num_tokens_to_issue，这个不一定是chunk的大小
-                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_bitmap.buffer(rdma_rank), num_tokens_to_issue, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), 
-                                                    qp_id, dst_rdma_rank == rdma_rank);                                                 
+                    // nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_bitmap.buffer(rdma_rank), num_tokens_to_issue, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), 
+                    //                                 qp_id, dst_rdma_rank == rdma_rank);                                                 
                 }
                 __syncwarp();
             }
@@ -789,8 +789,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail) {
-                        // cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
-                        cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_bitmap.buffer(src_rdma_rank)));
+                        cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                        // cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_bitmap.buffer(src_rdma_rank)));
 
                         // load bitmap, abondon rdma_channel_tail
                         // for (int i = 0; i < num_chunks_per_buffer; ++i) {
