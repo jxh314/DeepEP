@@ -784,7 +784,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail) {
-                        cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                        tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
                         
                         // load bitmap, abondon rdma_channel_tail
                         for (int i = 0; i < num_chunks_per_buffer; ++i) {
@@ -793,18 +793,15 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                         int chunk_id = cached_rdma_channel_tail / num_max_rdma_chunked_send_tokens;
                         int expected_bitmap_idx = chunk_id % num_chunks_per_buffer;
                         while (new_rdma_channel_bitmap[expected_bitmap_idx] - cached_rdma_channel_bitmap[expected_bitmap_idx] > 0) {
-                            tail += new_rdma_channel_bitmap[expected_bitmap_idx] - cached_rdma_channel_bitmap[expected_bitmap_idx];
-                            // uint64t* 使用 int* 来写有无问题？
-                            // st_relaxed_sys_global(reinterpret_cast<int*>(rdma_channel_bitmap.buffer(src_rdma_rank) + expected_bitmap_idx), 0);
-                            // atomicCAS(reinterpret_cast<unsigned long long*>(rdma_channel_bitmap.buffer(src_rdma_rank)) + expected_bitmap_idx, 1ULL, 0ULL);
+                            cached_rdma_channel_tail += new_rdma_channel_bitmap[expected_bitmap_idx] - cached_rdma_channel_bitmap[expected_bitmap_idx];
                             cached_rdma_channel_bitmap[expected_bitmap_idx] = new_rdma_channel_bitmap[expected_bitmap_idx];    
                             expected_bitmap_idx = (expected_bitmap_idx + 1) % num_chunks_per_buffer;
                         }     
                         
                         if(lane_id == 0 and channel_id == 0 and nvl_rank == 1) {
-                            printf("dispatch forwarder wrap %d, RDMA rank %d, src IB %d, channel %d, tail %p: %d, bitmap[0] %p: %d,head: %d\n",
-                                   warp_id, rdma_rank, src_rdma_rank, channel_id, rdma_channel_tail.buffer(src_rdma_rank), cached_rdma_channel_tail, \
-                                   rdma_channel_bitmap.buffer(src_rdma_rank), tail, cached_rdma_channel_head);
+                            printf("dispatch forwarder wrap %d, RDMA rank %d, src IB %d, channel %d, tail: %d, bitmap tail: %d, head: %d\n",
+                                   warp_id, rdma_rank, src_rdma_rank, channel_id, tail,\
+                                    cached_rdma_channel_tail, cached_rdma_channel_head);
                         }
                     }
                     if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
