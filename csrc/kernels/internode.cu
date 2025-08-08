@@ -384,9 +384,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     const bool is_forwarder = sm_id % 2 == 0;
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     // 根据 qp count 判断是否启用了 round robin mode
-    const bool round_robin = ibgda_get_state()->num_rc_per_pe == num_channels * 3;
-    // why num_rc_per_pe == num_channels ？
+    const bool round_robin = ibgda_get_state()->num_rc_per_pe >= num_channels * 3;
+    const int nqps_per_channel = ibgda_get_state()->num_rc_per_pe / num_channels - 1;
 
+    // why num_rc_per_pe == num_channels ？
     EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe == num_channels or ibgda_get_state()->num_rc_per_pe >= num_sms);
 
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
@@ -672,9 +673,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 auto num_tokens_to_issue = min(num_tokens_processed, num_max_rdma_chunked_send_tokens);
                 EP_DEVICE_ASSERT(num_tokens_to_issue >= 0 and num_tokens_to_issue <= synced_num_tokens_to_send);
                 const auto chunk_id = synced_last_issued_tail / num_max_rdma_chunked_send_tokens;
-                // 2 qps per channel in round-robin mode
-                bool round_robin = 0;
-                const auto qp_id = round_robin ? channel_id * 2 + chunk_id % 2 : channel_id;
+                // n qps per channel in round-robin mode
+                const auto qp_id = round_robin ? channel_id * nqps_per_channel + chunk_id % nqps_per_channel : channel_id;
                 if (dst_rdma_rank != rdma_rank) {
                     auto dst_slot_idx = synced_last_issued_tail % num_max_rdma_chunked_recv_tokens;
                     EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= num_max_rdma_chunked_recv_tokens);
@@ -695,8 +695,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     num_tokens_to_send -= num_tokens_to_issue;
                     auto dst_bitmap_idx = chunk_id % num_chunks_per_buffer;
                     const auto dst_ptr = rdma_channel_bitmap.buffer(rdma_rank) + dst_bitmap_idx;
-                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
-                                                    translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
+                    // nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
+                    //                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
                     nvshmemi_ibgda_amo_nonfetch_add(dst_ptr, num_tokens_to_issue, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
                                                     qp_id, dst_rdma_rank == rdma_rank);            
                 }
@@ -784,7 +784,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail) {
-                        tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                        // tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
                         
                         // load bitmap, abondon rdma_channel_tail
                         for (int i = 0; i < num_chunks_per_buffer; ++i) {
@@ -798,11 +798,11 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                             expected_bitmap_idx = (expected_bitmap_idx + 1) % num_chunks_per_buffer;
                         }     
                         
-                        if(lane_id == 0 and channel_id == 0 and nvl_rank == 1) {
-                            printf("dispatch forwarder wrap %d, RDMA rank %d, src IB %d, channel %d, tail: %d, bitmap tail: %d, head: %d\n",
-                                   warp_id, rdma_rank, src_rdma_rank, channel_id, tail,\
-                                    cached_rdma_channel_tail, cached_rdma_channel_head);
-                        }
+                        // if(lane_id == 0 and channel_id == 0 and nvl_rank == 1) {
+                        //     printf("dispatch forwarder wrap %d, RDMA rank %d, src IB %d, channel %d, tail: %d, bitmap tail: %d, head: %d\n",
+                        //            warp_id, rdma_rank, src_rdma_rank, channel_id, tail,\
+                        //             cached_rdma_channel_tail, cached_rdma_channel_head);
+                        // }
                     }
                     if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
                         break;
@@ -902,7 +902,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             // Update remote head
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + num_max_rdma_chunked_send_tokens and lane_id < kNumRDMARanks) {
                 nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank), min_head - last_head,
-                                                translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank), round_robin ? channel_id + num_sms : channel_id + num_channels, lane_id == rdma_rank);
+                                                translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank), 
+                                                round_robin ? channel_id + nqps_per_channel * num_channels : channel_id + num_channels, lane_id == rdma_rank);
                 last_head = min_head;
             }
 
