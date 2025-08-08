@@ -691,12 +691,11 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue;
                     auto dst_bitmap_idx = chunk_id % num_chunks_per_buffer;
-                    const auto dst_ptr = rdma_channel_bitmap.buffer(rdma_rank) + dst_bitmap_idx
+                    const auto dst_ptr = rdma_channel_bitmap.buffer(rdma_rank) + dst_bitmap_idx;
                     nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
                                                     translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
                     nvshmemi_ibgda_amo_nonfetch_add(dst_ptr, num_tokens_to_issue, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
-                                                    qp_id, dst_rdma_rank == rdma_rank);
-                                                    
+                                                    qp_id, dst_rdma_rank == rdma_rank);            
                 }
                 __syncwarp();
             }
