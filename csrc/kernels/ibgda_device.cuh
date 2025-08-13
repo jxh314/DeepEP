@@ -157,6 +157,8 @@ void ibgda_submit_requests(nvshmemi_ibgda_device_qp_t *qp, uint64_t base_wqe_idx
     // 等待前面的 WQE 槽位已被标记为 ready
     // 确保只有前面的所有 WQE 都已经被填充/提交，当前这批 WQE 才能被“就绪”并提交到硬件
     auto *ready_idx = reinterpret_cast<unsigned long long int*>(&mvars->tx_wq.ready_head);
+    // 原子compare and swap，如果 ready_idx 的值等于 base_wqe_idx，则将 ready_idx 的值设置为 new_wqe_idx
+    // 如果 ready_idx 的值不等于 base_wqe_idx，则继续循环
     while (atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx);
 
     // Always post, not in batch
@@ -367,6 +369,8 @@ nvshmemi_ibgda_put_nbi_warp(uint64_t req_rptr, uint64_t req_lptr, size_t bytes, 
             my_chunk_size = min(remaining_bytes, ibgda_get_lkey_and_rkey(my_laddr = req_lptr, &my_lkey, req_rptr, dst_pe, &my_raddr, &my_rkey));
 
         // Move one more message
+        // __shfl_sync(unsigned int mask, T var, int srcLane, int width = warpSize)
+        // 同一warp内的多线程间交换数据，mask表示参与交换的线程bmp，var是要交换的变量，srcLane是源线程的laneid，warpSize是warp的大小，默认32。返回是srcLane下var的值
         auto chunk_size = __shfl_sync(0xffffffff, my_chunk_size, static_cast<int>(num_wqes));
         remaining_bytes -= chunk_size;
         req_lptr += chunk_size;
@@ -437,10 +441,10 @@ __device__ static __forceinline__ void ibgda_write_amo_add_wqe(
 
 __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(void *rptr, const int& value, int pe, int qp_id, bool is_local_copy = false) {
     if (is_local_copy) {
-        // 如果是本地操作，直接用 CUDA 的 atomicAdd 实现原子加
+        // 本地操作，直接用 CUDA 的 atomicAdd 实现原子加
         atomicAdd(static_cast<unsigned long long*>(rptr), value);
     } else {
-        // 获取目标节点的 RDMA QP（队列对）指针
+        // 获取发往目标pe的 QP 
         nvshmemi_ibgda_device_qp_t *qp = ibgda_get_rc(pe, qp_id);
 
         __be32 rkey;
@@ -452,7 +456,7 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(void *rptr, cons
         uint64_t my_wqe_idx = ibgda_reserve_wqe_slots(qp, 1);
         void *wqe_ptrs = ibgda_get_wqe_ptr(qp, my_wqe_idx);
 
-        // 构造并写入一个 RDMA 原子加（atomic add）WQE（Work Queue Entry）
+        // 构造并写入一个 RDMA atomic add 的WQE（Work Queue Entry）
         ibgda_write_amo_add_wqe(qp, value, reinterpret_cast<uint64_t>(qp->ibuf.buf),
                                 qp->ibuf.lkey, raddr, rkey, my_wqe_idx, &wqe_ptrs);
 

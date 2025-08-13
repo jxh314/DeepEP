@@ -66,6 +66,22 @@ __device__ __forceinline__ int ld_acquire_sys_global(const int *ptr) {
 
 __device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t *ptr) {
     uint64_t ret;
+    /*
+    %0：输出操作数（ret寄存器）
+    %1：输入操作数（ptr寄存器）
+    [%1]：间接寻址，从ptr指向的地址加载
+
+    约束：
+    "=l"(ret)：输出约束，l表示64位寄存器 ,r：通用寄存器（32位）
+    "l"(ptr)：输入约束，l表示64位寄存器
+
+    ld.acquire.sys.global.u64：GPU PTX指令
+    ld：加载指令
+    acquire：内存序（memory ordering）确保这个load操作不会被后续的内存操作重排到前面
+    sys：系统级访问,绕过L1缓存，直接从L2缓存或全局内存加载
+    global：全局内存
+    u64：64位无符号整数
+    */
     asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
     return ret;
 }
