@@ -83,6 +83,15 @@ __device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t *ptr) {
     return ret;
 }
 
+// 128位向量加载（2个uint64_t）
+__device__ __forceinline__ void ld_acquire_sys_global_2(uint64_t* ret, const uint64_t *ptr) {
+    asm volatile(
+        "ld.acquire.sys.global.v2.u64 {%0, %1}, [%2];"
+        : "=l"(ret[0]), "=l"(ret[1])
+        : "l"(ptr)
+    );
+}
+
 __device__ __forceinline__ int ld_acquire_global(const int *ptr) {
     int ret;
     asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));

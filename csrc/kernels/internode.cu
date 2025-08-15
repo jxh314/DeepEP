@@ -53,7 +53,8 @@ std::pair<int, int> get_rdma_clean_meta(int hidden_int4, int num_scales, int num
     // Return `int32_t` offset and count to clean
     return {
         (get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_rdma_recv_buffer_tokens * num_rdma_ranks * 2 * num_channels) / sizeof(int),
-        (NUM_MAX_NVL_PEERS * 2 + 4) * num_rdma_ranks * 2 * num_channels
+        (NUM_MAX_NVL_PEERS * 2 + 4 + 128/*num rdma buffer chunks*/) * num_rdma_ranks * 2 * num_channels
+        // *2 是因为 kDecoupled=1，这里按照int32 计算 ，head 和tail是int 64，可以认为int 32 *2
     };
 }
 
@@ -382,7 +383,11 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     const auto num_channels = num_sms / 2, channel_id = sm_id / 2;
     const bool is_forwarder = sm_id % 2 == 0;
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
+    // 根据 qp count 判断是否启用了 round robin mode
+    const bool round_robin = ibgda_get_state()->num_rc_per_pe >= num_channels * 3;
+    const int nqps_per_channel = ibgda_get_state()->num_rc_per_pe / num_channels - 1;
 
+    // why num_rc_per_pe == num_channels ？
     EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe == num_channels or ibgda_get_state()->num_rc_per_pe >= num_sms);
 
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
@@ -416,6 +421,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     auto rdma_channel_meta = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS * 2 + 2, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_head = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
+    // each RDMA chunk needs one bitmap element
+    const int num_chunks_per_buffer = num_max_rdma_chunked_recv_tokens / num_max_rdma_chunked_send_tokens;
+    // each RDMA rank 的每个 channel 都有 num_chunks_per_buffer 个 uint64_t
+    auto rdma_channel_bitmap = SymBuffer<uint64_t, false>(rdma_buffer_ptr, num_chunks_per_buffer, kNumRDMARanks, channel_id, num_channels);
 
     // NVL buffer layouts
     // NOTES: `rs_wr_buffer_ptr` means "Read for Senders, Write for Receivers", `ws_rr_buffer_ptr` means "Write for Senders, Read for Receivers"
@@ -663,6 +672,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 // Issue RDMA send
                 auto num_tokens_to_issue = min(num_tokens_processed, num_max_rdma_chunked_send_tokens);
                 EP_DEVICE_ASSERT(num_tokens_to_issue >= 0 and num_tokens_to_issue <= synced_num_tokens_to_send);
+                const auto chunk_id = synced_last_issued_tail / num_max_rdma_chunked_send_tokens;
+                // n qps per channel in round-robin mode
+                const auto qp_id = round_robin ? channel_id * nqps_per_channel + chunk_id % nqps_per_channel : channel_id;
                 if (dst_rdma_rank != rdma_rank) {
                     auto dst_slot_idx = synced_last_issued_tail % num_max_rdma_chunked_recv_tokens;
                     EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= num_max_rdma_chunked_recv_tokens);
@@ -670,7 +682,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + dst_slot_idx * num_bytes_per_token);
                     const auto src_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + dst_slot_idx * num_bytes_per_token);
                     nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, src_ptr, num_bytes_per_msg,
-                                                      translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, lane_id, 0);
+                                                      translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id, lane_id, 0);
                 } else {
                     // Lighter fence for local RDMA rank
                     memory_fence();
@@ -681,8 +693,12 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 if (lane_id == dst_rdma_rank) {
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue;
-                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
-                                                    translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
+                    auto dst_bitmap_idx = chunk_id % num_chunks_per_buffer;
+                    const auto dst_ptr = rdma_channel_bitmap.buffer(rdma_rank) + dst_bitmap_idx;
+                    nvshmemi_ibgda_amo_nonfetch_add(dst_ptr, num_tokens_to_issue, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
+                                                    qp_id, dst_rdma_rank == rdma_rank);  
+                    // nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
+                    //                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
                 }
                 __syncwarp();
             }
@@ -739,7 +755,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         // NOTES: always start from the local rank
         int src_rdma_rank = sm_id % kNumRDMARanks;
         int cached_rdma_channel_head = 0, cached_rdma_channel_tail = 0;
+        // int old_tail=0;
         int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0, rdma_nvl_token_idx = 0;
+        int cached_rdma_channel_bitmap[128 /*max chunks per buffer*/];
+        memset(cached_rdma_channel_bitmap, 0, sizeof(int) * num_chunks_per_buffer);
         while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
             // Check destination queue emptiness, or wait a buffer to be released
             start_time = clock64();
@@ -762,8 +781,64 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             while (true) {
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
-                    if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail)
-                        cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                    if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail) {
+                        // old_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                        
+                        // load bitmap, abondon rdma_channel_tail
+                        int chunk_id = cached_rdma_channel_tail / num_max_rdma_chunked_send_tokens;
+                        int expected_bitmap_idx = chunk_id % num_chunks_per_buffer;
+
+                        #pragma unroll
+                        for(int checked_count = 0; checked_count < num_chunks_per_buffer; ++checked_count) {
+                            int new_bitmap_value = static_cast<int>(ld_acquire_sys_global(rdma_channel_bitmap.buffer(src_rdma_rank) + expected_bitmap_idx));
+                            int increment = new_bitmap_value - cached_rdma_channel_bitmap[expected_bitmap_idx];
+                            if (increment > 0) {
+                                // update tail
+                                cached_rdma_channel_tail += increment;
+                                cached_rdma_channel_bitmap[expected_bitmap_idx] = new_bitmap_value;
+                                expected_bitmap_idx = (expected_bitmap_idx + 1) % num_chunks_per_buffer;
+                            } else {
+                                break;
+                            }
+                        }
+                        
+                        /*
+                        bool break_flag = false;
+                        #pragma unroll
+                        for(int checked_count = 0; checked_count < num_chunks_per_buffer; ) {
+                            uint64_t bitmap_values[2];
+                            ld_acquire_sys_global_2(bitmap_values, rdma_channel_bitmap.buffer(src_rdma_rank) + expected_bitmap_idx);
+                            
+                            #pragma unroll
+                            for(int i = 0; i < 2; ++i) {
+                                if(checked_count + i >= num_chunks_per_buffer) {
+                                    break_flag = true;
+                                    break;
+                                }
+                                
+                                int new_bitmap_value = static_cast<int>(bitmap_values[i]);
+                                int increment = new_bitmap_value - cached_rdma_channel_bitmap[expected_bitmap_idx];
+                                if (increment > 0) {
+                                    // update tail
+                                    cached_rdma_channel_tail += increment;
+                                    cached_rdma_channel_bitmap[expected_bitmap_idx] = new_bitmap_value;
+                                    expected_bitmap_idx = (expected_bitmap_idx + 1) % num_chunks_per_buffer;
+                                    checked_count ++;
+                                } else {
+                                    break_flag = true;
+                                    break;
+                                }
+                            }
+                            
+                            if(break_flag)
+                                break;
+                        }*/
+                        
+                        // if(lane_id == 0 and channel_id == 3 and nvl_rank == 1) {
+                        //     printf("dispatch forwarder wrap %d, RDMA rank %d, src IB %d, channel %d, old_tail: %d, bitmap tail: %d, head: %d\n",
+                        //            warp_id, rdma_rank, src_rdma_rank, channel_id, old_tail, cached_rdma_channel_tail, cached_rdma_channel_head);
+                        // }
+                    }
                     if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
                         break;
                 }
@@ -862,7 +937,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             // Update remote head
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + num_max_rdma_chunked_send_tokens and lane_id < kNumRDMARanks) {
                 nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank), min_head - last_head,
-                                                translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank), channel_id + num_channels, lane_id == rdma_rank);
+                                                translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank), 
+                                                round_robin ? channel_id + nqps_per_channel * num_channels : channel_id + num_channels, lane_id == rdma_rank);
                 last_head = min_head;
             }
 
@@ -1388,6 +1464,8 @@ combine(int4* combined_x, float* combined_topk_weights,
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const auto num_channels = static_cast<int>(gridDim.x) / 2, channel_id = sm_id / 2;
     const bool is_forwarder_sm = sm_id % 2 == 1;
+    // const bool round_robin = ibgda_get_state()->num_rc_per_pe >= num_channels * 3;
+    // const int nqps_per_channel = ibgda_get_state()->num_rc_per_pe / num_channels - 1;
 
     EP_DEVICE_ASSERT(num_topk <= 32);
     EP_DEVICE_ASSERT(hidden % (sizeof(int4) / sizeof(dtype_t)) == 0);
