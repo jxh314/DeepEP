@@ -697,8 +697,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     const auto dst_ptr = rdma_channel_bitmap.buffer(rdma_rank) + dst_bitmap_idx;
                     nvshmemi_ibgda_amo_nonfetch_add(dst_ptr, num_tokens_to_issue, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
                                                     qp_id, dst_rdma_rank == rdma_rank);  
-                    // nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
-                    //                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
+                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
+                                                    translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
                 }
                 __syncwarp();
             }
@@ -755,7 +755,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         // NOTES: always start from the local rank
         int src_rdma_rank = sm_id % kNumRDMARanks;
         int cached_rdma_channel_head = 0, cached_rdma_channel_tail = 0;
-        // int old_tail=0;
+        int old_tail=0;
         int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0, rdma_nvl_token_idx = 0;
         int cached_rdma_channel_bitmap[128 /*max chunks per buffer*/];
         memset(cached_rdma_channel_bitmap, 0, sizeof(int) * num_chunks_per_buffer);
@@ -782,8 +782,13 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail) {
-                        // old_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                        // 计时点1: old_tail加载开始
+                        auto old_tail_start_time = clock64();
+                        old_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                        auto old_tail_end_time = clock64();
                         
+                        // 计时点2: bitmap检查开始
+                        auto bitmap_start_time = clock64();
                         // load bitmap, abondon rdma_channel_tail
                         int chunk_id = cached_rdma_channel_tail / num_max_rdma_chunked_send_tokens;
                         int expected_bitmap_idx = chunk_id % num_chunks_per_buffer;
@@ -801,6 +806,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                                 break;
                             }
                         }
+                        auto bitmap_end_time = clock64();
+                        
+                        auto old_tail_duration = old_tail_end_time - old_tail_start_time;
+                        auto bitmap_duration = bitmap_end_time - bitmap_start_time;
                         
                         /*
                         bool break_flag = false;
@@ -833,11 +842,11 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                             if(break_flag)
                                 break;
                         }*/
-                        
-                        // if(lane_id == 0 and channel_id == 3 and nvl_rank == 1) {
-                        //     printf("dispatch forwarder wrap %d, RDMA rank %d, src IB %d, channel %d, old_tail: %d, bitmap tail: %d, head: %d\n",
-                        //            warp_id, rdma_rank, src_rdma_rank, channel_id, old_tail, cached_rdma_channel_tail, cached_rdma_channel_head);
-                        // }
+
+                        if(lane_id == 0 and channel_id == 3 and nvl_rank == 1) {
+                            printf("dispatch forwarder wrap %d, RDMA rank %d, src IB %d, channel %d, old_tail: %d, bitmap tail: %d, head: %d, Timing - old_tail: %llu cycles, bitmap: %llu cycles\n",
+                                   warp_id, rdma_rank, src_rdma_rank, channel_id, old_tail, cached_rdma_channel_tail, cached_rdma_channel_head, old_tail_duration, bitmap_duration);
+                        }
                     }
                     if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
                         break;
