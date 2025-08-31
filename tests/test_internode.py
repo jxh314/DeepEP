@@ -182,7 +182,7 @@ def test_main(args: argparse.Namespace, num_sms: int,
         rdma_send_bytes = (dispatch_bf16_rdma_send_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_rdma_send_bytes
         nvl_recv_bytes = (dispatch_bf16_nvl_recv_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_nvl_recv_bytes
         for nvl_chunk_size in range(4, 45, 4):
-            for rdma_chunk_size in range(4, 33, 4):
+            for rdma_chunk_size in range(4, 33, 2):
                 config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
                 tune_args = {'x': current_x, 'handle': handle, 'config': config}
                 t, notify_t = bench_kineto(lambda: buffer.dispatch(**tune_args), ('dispatch', 'notify'))
@@ -210,7 +210,7 @@ def test_main(args: argparse.Namespace, num_sms: int,
     # Tune combine performance
     best_time, best_results = 1e10, None
     for nvl_chunk_size in range(1, 8, 1):
-        for rdma_chunk_size in range(12 if num_nodes == 2 else 8, 33, 4):
+        for rdma_chunk_size in range(12 if num_nodes == 2 else 8, 33, 2):
             config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
             tune_args = {'x': recv_x, 'handle': handle, 'config': config}
             t, notify_t = bench_kineto(lambda: buffer.combine(**tune_args), ('combine', 'notify'))
@@ -232,7 +232,13 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
     num_sms = 24
-    num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
+    # num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
+    # if num_qps_for_data(n) > 1, each channel will use n qps round-robin
+    num_qps_for_data = int(os.getenv('DEEPEP_NUM_QPS_FOR_DATA', 1))
+    # n qps for data transfer, 1 qp for head update
+    # TODO: nqps <= num Chunks per Buffer
+    num_qps_per_rank = num_sms // 2 * (num_qps_for_data + 1)
+    num_qps_per_rank = max(num_qps_per_rank, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
 
     buffer = deep_ep.Buffer(group, int(2e9), int(1e9), low_latency_mode=args.test_ll_compatibility,
                             num_qps_per_rank=num_qps_per_rank, explicitly_destroy=True)
